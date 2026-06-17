@@ -1,0 +1,10 @@
+[package]
+name = "aic-flash"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform CLI flasher for ArtInChip SoCs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusb = "0.9"
+crc32fast = "1"
