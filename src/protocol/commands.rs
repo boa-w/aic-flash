@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const CMD_GET_HWINFO: u8 = 0x00;
 pub const CMD_GET_TRACEINFO: u8 = 0x01;
 pub const CMD_WRITE: u8 = 0x02;

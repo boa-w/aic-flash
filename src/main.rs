@@ -8,7 +8,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "aic-flash", version, about = "Cross-platform flasher for ArtInChip SoCs")]
+#[command(
+    name = "aic-flash",
+    version,
+    about = "Cross-platform flasher for ArtInChip SoCs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

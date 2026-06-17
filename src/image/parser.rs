@@ -2,7 +2,21 @@ use crate::protocol::commands::{FwcMeta, FWC_META_SIZE};
 
 pub const FW_HEADER_SIZE: usize = 2048;
 
-/// ArtInChip firmware image header
+/// ArtInChip firmware image header (struct image_header_pack, 2048 bytes)
+///
+/// Core header (struct image_header_upgrade, 348 bytes):
+///   [0..8)     magic       "AIC.FW"
+///   [8..72)    platform    64 bytes
+///   [72..136)   product     64 bytes
+///   [136..200)  version     64 bytes
+///   [200..264)  media_type  64 bytes
+///   [264..268)  media_dev_id  u32 LE
+///   [268..332)  media_id    64 bytes (nand_array_org)
+///   [332..336)  meta_offset  u32 LE
+///   [336..340)  meta_size    u32 LE
+///   [340..344)  file_offset  u32 LE
+///   [344..348)  file_size    u32 LE
+///   [348..2048) pad         1700 zero bytes
 pub struct FwHeader {
     bytes: Vec<u8>,
 }
@@ -24,37 +38,47 @@ impl FwHeader {
     }
 
     pub fn platform_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[8..28])
+        std::str::from_utf8(&self.bytes[8..72])
             .unwrap_or("")
             .trim_end_matches('\0')
     }
 
     pub fn product_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[28..60])
+        std::str::from_utf8(&self.bytes[72..136])
             .unwrap_or("")
             .trim_end_matches('\0')
     }
 
     pub fn version_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[60..124])
+        std::str::from_utf8(&self.bytes[136..200])
             .unwrap_or("")
             .trim_end_matches('\0')
     }
 
-    pub fn media_type_val(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[128..132].try_into().unwrap())
+    pub fn media_type_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[200..264])
+            .unwrap_or("")
+            .trim_end_matches('\0')
+    }
+
+    pub fn media_dev_id(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[264..268].try_into().unwrap())
     }
 
     pub fn meta_offset_val(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[132..136].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[332..336].try_into().unwrap())
     }
 
-    pub fn meta_count_val(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[136..140].try_into().unwrap())
+    pub fn meta_size_val(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[336..340].try_into().unwrap())
     }
 
     pub fn file_offset_val(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[140..144].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[340..344].try_into().unwrap())
+    }
+
+    pub fn file_size_val(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[344..348].try_into().unwrap())
     }
 }
 
@@ -74,7 +98,12 @@ pub fn parse_image(data: &[u8]) -> Result<(FwHeader, Vec<FwcMeta>, &[u8]), Strin
     }
 
     let meta_offset = header.meta_offset_val() as usize;
-    let meta_count = header.meta_count_val() as usize;
+    let meta_size = header.meta_size_val() as usize;
+    let meta_count = if meta_size > 0 {
+        meta_size / FWC_META_SIZE
+    } else {
+        0
+    };
     let file_offset = header.file_offset_val() as usize;
 
     if meta_offset == 0 || meta_count == 0 {
@@ -110,14 +139,19 @@ pub fn print_image_info(data: &[u8]) -> Result<(), String> {
     let (header, metas, _payload) = parse_image(data)?;
 
     println!("=== Image Header ===");
-    println!("  Magic:     {}", header.magic_str());
-    println!("  Platform:  {}", header.platform_str());
-    println!("  Product:   {}", header.product_str());
-    println!("  Version:   {}", header.version_str());
-    println!("  Media type: {:#x}", header.media_type_val());
+    println!("  Magic:       {}", header.magic_str());
+    println!("  Platform:    {}", header.platform_str());
+    println!("  Product:     {}", header.product_str());
+    println!("  Version:     {}", header.version_str());
+    println!("  Media type:  {}", header.media_type_str());
+    println!("  Media dev:   {:#x}", header.media_dev_id());
     println!("  Meta offset: {:#x}", header.meta_offset_val());
-    println!("  Meta count: {}", header.meta_count_val());
+    println!(
+        "  Meta count:  {}",
+        meta_size_to_count(header.meta_size_val())
+    );
     println!("  File offset: {:#x}", header.file_offset_val());
+    println!("  File size:   {}", header.file_size_val());
 
     println!();
     println!("=== META Entries ({}) ===", metas.len());
@@ -136,4 +170,12 @@ pub fn print_image_info(data: &[u8]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn meta_size_to_count(sz: u32) -> u32 {
+    if sz > 0 {
+        sz / FWC_META_SIZE as u32
+    } else {
+        0
+    }
 }
