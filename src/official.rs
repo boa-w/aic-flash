@@ -271,6 +271,9 @@ pub fn build_args(args: &OfficialArgs) -> Result<Vec<String>, String> {
 }
 
 pub fn run_upgcmd(upgcmd: &Path, args: &[String]) -> Result<String, String> {
+    if upgcmd.as_os_str().is_empty() {
+        return Err("upgcmd compatibility path is not configured".to_string());
+    }
     let output = Command::new(upgcmd)
         .args(args)
         .output()
@@ -298,19 +301,16 @@ pub fn run_upgcmd(upgcmd: &Path, args: &[String]) -> Result<String, String> {
 }
 
 pub fn run_adb_enter_upgrade(aiburn_dir: &Path) -> Result<String, String> {
-    let adb = aiburn_dir.join("adb").join("adb.exe");
+    let adb = adb_path(aiburn_dir)?;
     run_program_capture(&adb, &["shell", "aicupg"])
 }
 
-pub fn run_env_check(aiburn_dir: &Path) -> Result<(), String> {
-    run_program_detached(&aiburn_dir.join("EnvCheck.exe"))
-}
-
-pub fn run_driver_installer(aiburn_dir: &Path) -> Result<(), String> {
-    run_program_detached(&aiburn_dir.join("driver").join("InstallDriver.exe"))
-}
-
 pub fn open_manual(aiburn_dir: &Path) -> Result<(), String> {
+    if aiburn_dir.as_os_str().is_empty() {
+        return Err(
+            "Manual is only available when AiBurn compatibility dir is configured".to_string(),
+        );
+    }
     let manual = aiburn_dir.join("aiburn_manual.pdf");
     if !manual.exists() {
         return Err(format!("Manual not found: {}", manual.display()));
@@ -323,7 +323,15 @@ pub fn open_manual(aiburn_dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to open '{}': {}", manual.display(), e))?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&manual)
+            .spawn()
+            .map_err(|e| format!("Failed to open '{}': {}", manual.display(), e))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         Command::new("xdg-open")
             .arg(&manual)
@@ -331,6 +339,33 @@ pub fn open_manual(aiburn_dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to open '{}': {}", manual.display(), e))?;
         Ok(())
     }
+    #[cfg(all(not(windows), not(unix)))]
+    {
+        Err(format!(
+            "Opening manuals is not implemented: {}",
+            manual.display()
+        ))
+    }
+}
+
+fn adb_path(aiburn_dir: &Path) -> Result<PathBuf, String> {
+    let bundled = if cfg!(windows) {
+        aiburn_dir.join("adb").join("adb.exe")
+    } else {
+        aiburn_dir.join("adb").join("adb")
+    };
+    if bundled.exists() {
+        return Ok(bundled);
+    }
+    find_in_path(if cfg!(windows) { "adb.exe" } else { "adb" })
+        .ok_or_else(|| "adb not found in compatibility directory or PATH".to_string())
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.exists())
 }
 
 fn required_path(path: Option<&Path>, label: &str) -> Result<String, String> {
@@ -363,59 +398,6 @@ fn run_program_capture(path: &Path, args: &[&str]) -> Result<String, String> {
             text.trim_end()
         ))
     }
-}
-
-fn run_program_detached(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Err(format!("Program not found: {}", path.display()));
-    }
-    match Command::new(path).spawn() {
-        Ok(_) => {}
-        Err(e) if is_elevation_required(&e) => run_program_elevated(path)?,
-        Err(e) => return Err(format!("Failed to run '{}': {}", path.display(), e)),
-    }
-    Ok(())
-}
-
-fn is_elevation_required(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(740)
-}
-
-#[cfg(windows)]
-fn run_program_elevated(path: &Path) -> Result<(), String> {
-    let path_text = powershell_single_quoted(&path.to_string_lossy());
-    let command = format!("Start-Process -FilePath {} -Verb RunAs", path_text);
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &command,
-        ])
-        .status()
-        .map_err(|e| format!("Failed to elevate '{}': {}", path.display(), e))?;
-    if !status.success() {
-        return Err(format!(
-            "Failed to elevate '{}': powershell exited with {}",
-            path.display(),
-            status
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn powershell_single_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(not(windows))]
-fn run_program_elevated(path: &Path) -> Result<(), String> {
-    Err(format!(
-        "Program requires elevated privileges: {}",
-        path.display()
-    ))
 }
 
 fn required_text(value: &str, label: &str) -> Result<String, String> {

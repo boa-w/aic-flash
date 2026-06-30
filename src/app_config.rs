@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::standalone;
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub auto_burn: bool,
@@ -13,25 +15,29 @@ pub struct AppConfig {
     pub language: String,
     pub image_path: Option<PathBuf>,
     pub selected_parts: Vec<String>,
+    pub app_dir: PathBuf,
     pub aiburn_dir: PathBuf,
     pub upgcmd_path: PathBuf,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let aiburn_dir = PathBuf::from(r"C:\ArtInChip\AiBurn");
+        let aiburn_dir = default_compat_dir();
+        let app_dir = standalone::default_app_dir();
+        let upgcmd_path = default_compat_tool_path(&aiburn_dir);
         Self {
             auto_burn: false,
             verbose: false,
             read_device_log: false,
-            adb_scan: true,
+            adb_scan: false,
             retry_count: 1,
             block_error_log: false,
             burn_timeout_secs: 60,
             language: "zh_cn".to_string(),
             image_path: None,
             selected_parts: vec!["spl".to_string(), "env".to_string(), "os".to_string()],
-            upgcmd_path: aiburn_dir.join("upgcmd.exe"),
+            app_dir,
+            upgcmd_path,
             aiburn_dir,
         }
     }
@@ -39,11 +45,18 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load_default() -> Self {
-        let mut cfg = Self::default();
+        let cfg = Self::default();
+        let project_ini = standalone::config_path();
+        if project_ini.exists() {
+            if let Ok(loaded) = Self::load_from(&project_ini) {
+                return loaded;
+            }
+        }
         let official_ini = cfg.aiburn_dir.join("AiBurn.ini");
         if official_ini.exists() {
-            if let Ok(loaded) = Self::load_from(&official_ini) {
-                cfg = loaded;
+            if let Ok(mut loaded) = Self::load_from(&official_ini) {
+                loaded.app_dir = cfg.app_dir;
+                return loaded;
             }
         }
         cfg
@@ -54,8 +67,16 @@ impl AppConfig {
             .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
         let mut cfg = Self::default();
         if let Some(parent) = path.parent() {
-            cfg.aiburn_dir = parent.to_path_buf();
-            cfg.upgcmd_path = parent.join("upgcmd.exe");
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("config.ini"))
+            {
+                cfg.app_dir = parent.to_path_buf();
+            } else if compat_tool_path(parent).exists() {
+                cfg.aiburn_dir = parent.to_path_buf();
+                cfg.upgcmd_path = compat_tool_path(parent);
+            }
         }
 
         let mut section = String::new();
@@ -98,7 +119,10 @@ language={}\n\
 \n\
 [common]\n\
 image_path={}\n\
-selected_parts=\"{}\"\n",
+selected_parts=\"{}\"\n\
+app_dir={}\n\
+aiburn_dir={}\n\
+upgcmd_path={}\n",
             bool_to_int(self.auto_burn),
             bool_to_int(self.verbose),
             bool_to_int(self.read_device_log),
@@ -108,8 +132,15 @@ selected_parts=\"{}\"\n",
             self.burn_timeout_secs.max(1),
             self.language,
             image_path,
-            selected
+            selected,
+            self.app_dir.to_string_lossy().replace('\\', "/"),
+            self.aiburn_dir.to_string_lossy().replace('\\', "/"),
+            self.upgcmd_path.to_string_lossy().replace('\\', "/")
         );
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create '{}': {}", parent.display(), e))?;
+        }
         fs::write(path, text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
     }
 
@@ -143,13 +174,59 @@ selected_parts=\"{}\"\n",
                     .filter(|part| !part.is_empty())
                     .collect();
             }
+            ("common", "app_dir") => {
+                if !value.is_empty() {
+                    self.app_dir = PathBuf::from(value);
+                }
+            }
+            ("common", "aiburn_dir") => {
+                if !value.is_empty() {
+                    self.aiburn_dir = PathBuf::from(value);
+                }
+            }
+            ("common", "upgcmd_path") => {
+                if !value.is_empty() {
+                    self.upgcmd_path = PathBuf::from(value);
+                }
+            }
             _ => {}
         }
     }
 }
 
-pub fn load_image_history(aiburn_dir: &Path) -> Vec<(PathBuf, String)> {
-    let path = aiburn_dir.join("img_history.txt");
+fn default_compat_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"C:\ArtInChip\AiBurn")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::new()
+    }
+}
+
+pub fn compat_tool_name() -> &'static str {
+    if cfg!(windows) {
+        "upgcmd.exe"
+    } else {
+        "upgcmd"
+    }
+}
+
+pub fn compat_tool_path(dir: &Path) -> PathBuf {
+    dir.join(compat_tool_name())
+}
+
+fn default_compat_tool_path(dir: &Path) -> PathBuf {
+    if dir.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        compat_tool_path(dir)
+    }
+}
+
+pub fn load_image_history(app_dir: &Path) -> Vec<(PathBuf, String)> {
+    let path = app_dir.join("img_history.txt");
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -161,8 +238,10 @@ pub fn load_image_history(aiburn_dir: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-pub fn append_image_history(aiburn_dir: &Path, image: &Path) -> Result<(), String> {
-    let path = aiburn_dir.join("img_history.txt");
+pub fn append_image_history(app_dir: &Path, image: &Path) -> Result<(), String> {
+    fs::create_dir_all(app_dir)
+        .map_err(|e| format!("Failed to create '{}': {}", app_dir.display(), e))?;
+    let path = app_dir.join("img_history.txt");
     let timestamp = current_timestamp();
     let line = format!(
         "{}, {}\n",
@@ -204,4 +283,52 @@ fn current_timestamp() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("unix_{}", secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compat_tool_name_matches_platform() {
+        if cfg!(windows) {
+            assert_eq!(compat_tool_name(), "upgcmd.exe");
+        } else {
+            assert_eq!(compat_tool_name(), "upgcmd");
+        }
+    }
+
+    #[test]
+    fn empty_default_compat_dir_does_not_create_fake_tool_path() {
+        let path = default_compat_tool_path(Path::new(""));
+        assert!(path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn saves_and_loads_project_paths() {
+        let unique = format!(
+            "aic-flash-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let path = dir.join("config.ini");
+        let mut cfg = AppConfig::default();
+        cfg.app_dir = dir.clone();
+        cfg.aiburn_dir = dir.join("compat");
+        cfg.upgcmd_path = compat_tool_path(&cfg.aiburn_dir);
+        cfg.selected_parts = vec!["spl".to_string(), "os".to_string()];
+
+        cfg.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+
+        assert_eq!(loaded.app_dir, dir);
+        assert_eq!(loaded.aiburn_dir, cfg.aiburn_dir);
+        assert_eq!(loaded.upgcmd_path, cfg.upgcmd_path);
+        assert_eq!(loaded.selected_parts, cfg.selected_parts);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 }

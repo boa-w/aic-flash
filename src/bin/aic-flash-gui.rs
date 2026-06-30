@@ -3,10 +3,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use aic_flash::app_config::{append_image_history, load_image_history, AppConfig};
+use aic_flash::app_config::{
+    append_image_history, compat_tool_path, load_image_history, AppConfig,
+};
 use aic_flash::i18n::{command_label, tr, Language, Msg};
 use aic_flash::image::parser::{self, ImageSummary, MetaSummary};
 use aic_flash::official::{self, OfficialArgs, OfficialCommand};
+use aic_flash::standalone;
 use aic_flash::usb::device::{AicDevice, BurnEvent, BurnOptions, DeviceInfo};
 use eframe::egui;
 
@@ -48,8 +51,8 @@ impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         let config = AppConfig::load_default();
-        let settings_path = config.aiburn_dir.join("AiBurn.ini");
-        let image_history = load_image_history(&config.aiburn_dir);
+        let settings_path = config.app_dir.join("config.ini");
+        let image_history = load_image_history(&config.app_dir);
         let mut app = Self {
             selected_parts: config.selected_parts.clone(),
             official_args: OfficialArgs {
@@ -126,8 +129,8 @@ impl GuiApp {
                     self.t(Msg::ParseImageHeaderFrom),
                     path.display()
                 ));
-                let _ = append_image_history(&self.config.aiburn_dir, &path);
-                self.image_history = load_image_history(&self.config.aiburn_dir);
+                let _ = append_image_history(&self.config.app_dir, &path);
+                self.image_history = load_image_history(&self.config.app_dir);
             }
             Err(e) => self.log(format!("{}: {}", self.t(Msg::ImageParseFailed), e)),
         }
@@ -628,14 +631,14 @@ impl GuiApp {
             let mut path_text = self.config.upgcmd_path.display().to_string();
             let response =
                 ui.add(egui::TextEdit::singleline(&mut path_text).desired_width(f32::INFINITY));
-            if response.lost_focus() && !path_text.trim().is_empty() {
+            if response.lost_focus() {
                 self.config.upgcmd_path = PathBuf::from(path_text.trim());
             }
             if ui.button(self.t(Msg::Browse)).clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("upgcmd", &["exe"])
-                    .pick_file()
-                {
+                let dialog = rfd::FileDialog::new();
+                #[cfg(windows)]
+                let dialog = dialog.add_filter("upgcmd", &["exe"]);
+                if let Some(path) = dialog.pick_file() {
                     self.config.upgcmd_path = path;
                 }
             }
@@ -681,13 +684,13 @@ impl GuiApp {
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button(self.t(Msg::EnvCheck)).clicked() {
-                match official::run_env_check(&self.config.aiburn_dir) {
-                    Ok(()) => self.log(self.t(Msg::StartedEnvCheck)),
-                    Err(e) => self.log(e),
+                let report = standalone::environment_report(self.config.image_path.as_deref());
+                for line in report.lines() {
+                    self.log(line);
                 }
             }
             if ui.button(self.t(Msg::Driver)).clicked() {
-                match official::run_driver_installer(&self.config.aiburn_dir) {
+                match standalone::install_driver() {
                     Ok(()) => self.log(self.t(Msg::StartedDriverInstaller)),
                     Err(e) => self.log(e),
                 }
@@ -844,25 +847,42 @@ impl GuiApp {
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading(self.t(Msg::TabSettings));
         ui.horizontal(|ui| {
-            ui.label(self.t(Msg::AiBurnDir));
-            let mut text = self.config.aiburn_dir.display().to_string();
+            ui.label(self.t(Msg::AppDataDir));
+            let mut text = self.config.app_dir.display().to_string();
             let response =
                 ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
             if response.lost_focus() && !text.trim().is_empty() {
                 let path = PathBuf::from(text.trim());
+                if path != self.config.app_dir {
+                    self.config.app_dir = path.clone();
+                    self.settings_path = path.join("config.ini");
+                    self.image_history = load_image_history(&self.config.app_dir);
+                }
+            }
+            if ui.button(self.t(Msg::Browse)).clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.config.app_dir = path.clone();
+                    self.settings_path = path.join("config.ini");
+                    self.image_history = load_image_history(&self.config.app_dir);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::AiBurnDir));
+            let mut text = self.config.aiburn_dir.display().to_string();
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+            if response.lost_focus() {
+                let path = PathBuf::from(text.trim());
                 if path != self.config.aiburn_dir {
                     self.config.aiburn_dir = path.clone();
-                    self.config.upgcmd_path = path.join("upgcmd.exe");
-                    self.settings_path = path.join("AiBurn.ini");
-                    self.image_history = load_image_history(&self.config.aiburn_dir);
+                    self.config.upgcmd_path = compat_tool_path(&path);
                 }
             }
             if ui.button(self.t(Msg::Browse)).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.config.aiburn_dir = path.clone();
-                    self.config.upgcmd_path = path.join("upgcmd.exe");
-                    self.settings_path = path.join("AiBurn.ini");
-                    self.image_history = load_image_history(&self.config.aiburn_dir);
+                    self.config.upgcmd_path = compat_tool_path(&path);
                 }
             }
         });

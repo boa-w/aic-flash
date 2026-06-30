@@ -8,6 +8,16 @@ from the Luban-Lite SDK).
 
 Prerequisites: [Rust] 1.70+.
 
+Platform notes:
+
+- Windows: the GUI can install a WinUSB binding for VID `33C3`, PID `6677`
+  through `pnputil` with UAC elevation.
+- Linux: install the native build dependencies for libusb, for example
+  `libusb-1.0-0-dev`, `libudev-dev`, and `pkg-config` on Debian/Ubuntu. The
+  GUI can install a udev rule for non-root USB access.
+- macOS: install Rust and, when needed by your toolchain, `libusb` through
+  Homebrew. No kernel driver install is normally required.
+
 ```sh
 cargo build --release
 ```
@@ -30,14 +40,25 @@ The GUI binary is placed at `target/release/aic-flash-gui`.
 aic-flash scan          # list connected ArtInChip devices
 aic-flash info          # query connected device (HWINFO, storage media)
 aic-flash info <img>    # parse .img file header and META entries
+aic-flash env-check [img]        # check config, USB access, and optional image
+aic-flash install-usb-access     # install WinUSB binding or Linux udev rule
 aic-flash burn <img>    # burn firmware image to device
 aic-flash burn <img> --no-reset  # burn without resetting
 ```
 
 ## GUI
 
-The GUI mirrors the official AiBurn workflow and reads the official default
-configuration from `C:\ArtInChip\AiBurn\AiBurn.ini` when present:
+The GUI implements the AiBurn-compatible workflow natively. It stores its own
+configuration under the platform user configuration directory:
+
+- Windows: `%APPDATA%\aic-flash\config.ini`
+- macOS: `~/Library/Application Support/aic-flash/config.ini`
+- Linux: `$XDG_CONFIG_HOME/aic-flash/config.ini` or
+  `~/.config/aic-flash/config.ini`
+
+If an official `C:\ArtInChip\AiBurn\AiBurn.ini` exists on Windows it can still
+be imported for compatibility, but the core burn flow does not require the
+official package.
 
 ```sh
 cargo run --bin aic-flash-gui
@@ -51,22 +72,52 @@ Implemented GUI features:
 - AiBurn-style online burn flow with updater stage, reconnect wait,
   `FULL_DISK_UPGRADE`, `image.info`, selected target components, upgrade end,
   progress events, CRC checks, and optional reset.
-- Settings compatible with the official `AiBurn.ini` fields:
+- Standalone environment check for USB access, config directory writability,
+  selected image parsing, and driver readiness.
+- Built-in USB access setup: Windows WinUSB INF installation through `pnputil`,
+  Linux udev rule installation, and macOS no-driver status reporting.
+- Settings compatible with the original `AiBurn.ini` fields:
   `auto_burn`, `is_verbose`, `read_device_log`, `adb_scan`, `retry_cnt`,
   `block_err_log`, `burn_timeout`, `language`, `image_path`, and
   `selected_parts`.
 - Real GUI internationalization with Simplified Chinese (`zh_cn`) and English
-  (`en`), controlled by the `language` setting and saved back to `AiBurn.ini`.
-- An official tools page that wraps `upgcmd.exe` for the advanced functions
-  exposed by the ArtInChip package: list devices, parse/extract image, device
-  log, shell command, continue boot, go to bootloader, memory read/write,
-  32-bit register read/write, memory test, execute, hexdump, fill/clear,
-  full image upgrade through the official tool, dump partition, list media,
-  list partition table, flash erase, RAM boot, JTAG unlock data, JTAG unlock,
-  and raw `upgcmd` arguments.
+  (`en`), controlled by the `language` setting.
+- An advanced tools page. Native environment check and driver install are
+  built in; `upgcmd.exe` remains available as an optional compatibility
+  backend for advanced commands not yet migrated.
 
-By default the GUI looks for official tools under `C:\ArtInChip\AiBurn`, but
-the path can be changed in Settings.
+On Windows the optional compatibility path defaults to `C:\ArtInChip\AiBurn`.
+On macOS and Linux it is empty by default. If you provide a compatibility
+directory there, the GUI looks for `upgcmd` rather than `upgcmd.exe`. Normal
+image parsing and online burning work without that directory.
+
+The same standalone checks are available without the GUI:
+
+```sh
+aic-flash env-check firmware.img
+aic-flash install-usb-access
+```
+
+### Linux USB permissions
+
+For non-root access, install the udev rule from the GUI Driver button or run
+the equivalent manually:
+
+```sh
+sudo tee /etc/udev/rules.d/99-aic-flash.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="33c3", ATTR{idProduct}=="6677", TAG+="uaccess", MODE="0666"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Reconnect the device after installing the rule.
+
+### macOS USB notes
+
+No kernel driver is normally required. If the device opens in the GUI but a
+transaction times out immediately, reconnect the board and close other USB
+debugging tools before retrying.
 
 ### Examples
 
@@ -109,7 +160,7 @@ The USB protocol is fully documented in the Luban-Lite SDK
 | Layer | File | Notes |
 |-------|------|-------|
 | Transport | `data_trans_layer.h` | CBW (USBC, 31 B) / CSW (USBS, 13 B), EP 0x02/0x81 |
-| Application | `aicupg.h` | cmd_header (UPGC, 24 B), resp_header (UPGR, 24 B) |
+| Application | `aicupg.h` | cmd_header (UPGC, 16 B), resp_header (UPGR, 16 B) |
 | Commands | `basic_cmd.c`, `fwc_cmd.c` | GET_HWINFO, SET_FWC_META, SEND_FWC_DATA, ... |
 | Image | `mk_image.py` | 2048 B header (AIC.FW), 512 B META entries |
 

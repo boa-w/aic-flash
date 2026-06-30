@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use aic_flash::image;
+use aic_flash::standalone;
 use aic_flash::usb;
 use clap::{Parser, Subcommand};
 
@@ -35,6 +36,14 @@ enum Commands {
         #[arg(long)]
         no_reset: bool,
     },
+    /// Check local config, USB access, and optional image parsing
+    EnvCheck {
+        /// Optional .img file to parse during the check
+        #[arg(value_name = "IMAGE")]
+        image: Option<PathBuf>,
+    },
+    /// Install platform USB access support (WinUSB INF or Linux udev rule)
+    InstallUsbAccess,
 }
 
 fn main() {
@@ -44,6 +53,8 @@ fn main() {
         Commands::Scan => cmd_scan(),
         Commands::Info { image } => cmd_info(image),
         Commands::Burn { image, no_reset } => cmd_burn(image, no_reset),
+        Commands::EnvCheck { image } => cmd_env_check(image),
+        Commands::InstallUsbAccess => cmd_install_usb_access(),
     }
 }
 
@@ -153,4 +164,18 @@ fn cmd_burn(image: PathBuf, no_reset: bool) {
     }
 
     println!("Burn completed successfully!");
+}
+
+fn cmd_env_check(image: Option<PathBuf>) {
+    println!("{}", standalone::environment_report(image.as_deref()));
+}
+
+fn cmd_install_usb_access() {
+    match standalone::install_driver() {
+        Ok(()) => println!("USB access setup completed."),
+        Err(e) => {
+            eprintln!("USB access setup failed: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
