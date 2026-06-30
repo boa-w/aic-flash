@@ -662,12 +662,24 @@ impl GuiApp {
         });
 
         self.ui_official_args(ui);
+        ui.separator();
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!self.busy, |ui| {
                 if ui.button(self.t(Msg::Run)).clicked() {
                     self.start_official_command();
                 }
             });
+            match official::build_args(&self.official_args) {
+                Ok(args) => {
+                    ui.label(format!("{}: {}", self.t(Msg::ArgsPrefix), args.join(" ")));
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(180, 40, 40), e);
+                }
+            }
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
             if ui.button(self.t(Msg::EnvCheck)).clicked() {
                 match official::run_env_check(&self.config.aiburn_dir) {
                     Ok(()) => self.log(self.t(Msg::StartedEnvCheck)),
@@ -684,14 +696,6 @@ impl GuiApp {
                 match official::open_manual(&self.config.aiburn_dir) {
                     Ok(()) => self.log(self.t(Msg::OpenedManual)),
                     Err(e) => self.log(e),
-                }
-            }
-            match official::build_args(&self.official_args) {
-                Ok(args) => {
-                    ui.label(format!("{}: {}", self.t(Msg::ArgsPrefix), args.join(" ")));
-                }
-                Err(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(180, 40, 40), e);
                 }
             }
         });

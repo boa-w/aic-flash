@@ -369,10 +369,53 @@ fn run_program_detached(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Program not found: {}", path.display()));
     }
-    Command::new(path)
-        .spawn()
-        .map_err(|e| format!("Failed to run '{}': {}", path.display(), e))?;
+    match Command::new(path).spawn() {
+        Ok(_) => {}
+        Err(e) if is_elevation_required(&e) => run_program_elevated(path)?,
+        Err(e) => return Err(format!("Failed to run '{}': {}", path.display(), e)),
+    }
     Ok(())
+}
+
+fn is_elevation_required(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(740)
+}
+
+#[cfg(windows)]
+fn run_program_elevated(path: &Path) -> Result<(), String> {
+    let path_text = powershell_single_quoted(&path.to_string_lossy());
+    let command = format!("Start-Process -FilePath {} -Verb RunAs", path_text);
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .status()
+        .map_err(|e| format!("Failed to elevate '{}': {}", path.display(), e))?;
+    if !status.success() {
+        return Err(format!(
+            "Failed to elevate '{}': powershell exited with {}",
+            path.display(),
+            status
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn run_program_elevated(path: &Path) -> Result<(), String> {
+    Err(format!(
+        "Program requires elevated privileges: {}",
+        path.display()
+    ))
 }
 
 fn required_text(value: &str, label: &str) -> Result<String, String> {
