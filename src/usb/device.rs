@@ -13,9 +13,73 @@ const BULK_IN_EP: u8 = 0x81;
 const TIMEOUT_MS: Duration = Duration::from_secs(30);
 const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
 const CHUNK_SIZE: u32 = 1024 * 1024;
-const BULK_WRITE_CHUNK: usize = 16 * 1024;
+const BULK_WRITE_CHUNK: usize = 64 * 1024;
 const DEFAULT_BURN_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATER_PROBE_DELAY: Duration = Duration::from_millis(30);
+const RECONNECT_SETTLE_DELAY: Duration = Duration::from_millis(120);
+const START_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const START_WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const OFFICIAL_UPG_CFG_RESERVED: [u8; 31] = [
+    0xea, 0x00, 0x00, 0xbc, 0xf5, 0x44, 0x04, 0x50, 0xf5, 0x44, 0x04, 0x01, 0x00, 0x00, 0x00, 0x18,
+    0x73, 0xdf, 0x05, 0x50, 0xf5, 0x44, 0x04, 0x40, 0xfe, 0xf1, 0x00, 0x18, 0x73, 0xdf, 0x05,
+];
 const DEFAULT_SELECTED_PARTS: &[&str] = &["spl", "env", "os"];
+
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub bus_number: u8,
+    pub address: u8,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub port_path: String,
+    pub speed: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnOptions {
+    pub selected_parts: Vec<String>,
+    pub reset_after_burn: bool,
+    pub burn_timeout: Duration,
+}
+
+impl Default for BurnOptions {
+    fn default() -> Self {
+        Self {
+            selected_parts: DEFAULT_SELECTED_PARTS
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect(),
+            reset_after_burn: true,
+            burn_timeout: DEFAULT_BURN_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum BurnEvent {
+    Log(String),
+    Stage(String),
+    ComponentStarted {
+        name: String,
+        partition: String,
+        size: usize,
+    },
+    ComponentProgress {
+        name: String,
+        sent: usize,
+        total: usize,
+    },
+    OverallProgress {
+        sent: usize,
+        total: usize,
+    },
+    ComponentFinished {
+        name: String,
+    },
+    Finished,
+}
+
+pub type BurnCallback<'a> = dyn FnMut(BurnEvent) + Send + 'a;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CswPolicy {
@@ -32,10 +96,63 @@ pub struct AicDevice {
     handle: DeviceHandle<rusb::Context>,
     tag: u32,
     in_buf: Vec<u8>,
+    bus_number: u8,
+    address: u8,
 }
 
 impl AicDevice {
+    pub fn scan_devices() -> Result<Vec<DeviceInfo>, String> {
+        let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
+        let devices = context
+            .devices()
+            .map_err(|e| format!("Failed to list USB devices: {}", e))?;
+
+        let mut found = Vec::new();
+        for device in devices.iter() {
+            let desc = device
+                .device_descriptor()
+                .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
+            if desc.vendor_id() != AIC_VID || desc.product_id() != AIC_PID {
+                continue;
+            }
+            let port_path = device
+                .port_numbers()
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
+                .unwrap_or_default();
+            found.push(DeviceInfo {
+                bus_number: device.bus_number(),
+                address: device.address(),
+                vendor_id: desc.vendor_id(),
+                product_id: desc.product_id(),
+                port_path,
+                speed: format!("{:?}", device.speed()),
+            });
+        }
+        Ok(found)
+    }
+
     pub fn open_first() -> Result<Self, String> {
+        Self::open_matching(None)
+    }
+
+    pub fn open_by_location(bus_number: u8, address: u8) -> Result<Self, String> {
+        Self::open_matching(Some((bus_number, address)))
+    }
+
+    fn open_matching(location: Option<(u8, u8)>) -> Result<Self, String> {
+        Self::open_matching_with_recovery(location, false)
+    }
+
+    fn open_matching_with_recovery(
+        location: Option<(u8, u8)>,
+        recover_endpoints: bool,
+    ) -> Result<Self, String> {
         let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
 
         let devices = context
@@ -47,6 +164,11 @@ impl AicDevice {
                 .device_descriptor()
                 .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
             if desc.vendor_id() == AIC_VID && desc.product_id() == AIC_PID {
+                if let Some((bus, address)) = location {
+                    if device.bus_number() != bus || device.address() != address {
+                        continue;
+                    }
+                }
                 let handle = device
                     .open()
                     .map_err(|e| format!("Failed to open device: {}", e))?;
@@ -83,23 +205,32 @@ impl AicDevice {
                     .claim_interface(0)
                     .map_err(|e| format!("Failed to claim interface: {}", e))?;
 
-                let _ = handle.clear_halt(BULK_OUT_EP);
-                let _ = handle.clear_halt(BULK_IN_EP);
-                eprintln!(
-                    "  Cleared halt on EP 0x{:02x} and 0x{:02x}",
-                    BULK_OUT_EP, BULK_IN_EP
-                );
-
                 let mut dev = Self {
                     handle,
                     tag: 1,
                     in_buf: Vec::new(),
+                    bus_number: device.bus_number(),
+                    address: device.address(),
                 };
-                dev.drain_in_endpoint(Duration::from_millis(50), 64 * 1024)?;
+                if recover_endpoints {
+                    let _ = dev.handle.clear_halt(BULK_OUT_EP);
+                    let _ = dev.handle.clear_halt(BULK_IN_EP);
+                    eprintln!(
+                        "  Cleared halt on EP 0x{:02x} and 0x{:02x}",
+                        BULK_OUT_EP, BULK_IN_EP
+                    );
+                    dev.drain_in_endpoint(Duration::from_millis(50), 64 * 1024)?;
+                }
                 return Ok(dev);
             }
         }
-        Err("No ArtInChip device found (VID=0x33C3, PID=0x6677)".to_string())
+        match location {
+            Some((bus, address)) => Err(format!(
+                "No ArtInChip device found at bus {} address {} (VID=0x33C3, PID=0x6677)",
+                bus, address
+            )),
+            None => Err("No ArtInChip device found (VID=0x33C3, PID=0x6677)".to_string()),
+        }
     }
 
     fn reopen(&mut self) -> Result<(), String> {
@@ -108,19 +239,63 @@ impl AicDevice {
         Ok(())
     }
 
+    fn has_device_at(bus_number: u8, address: u8) -> Result<bool, String> {
+        let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
+        let devices = context
+            .devices()
+            .map_err(|e| format!("Failed to list USB devices: {}", e))?;
+
+        for device in devices.iter() {
+            let desc = device
+                .device_descriptor()
+                .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
+            if desc.vendor_id() == AIC_VID
+                && desc.product_id() == AIC_PID
+                && device.bus_number() == bus_number
+                && device.address() == address
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn wait_reconnect(&mut self, timeout: Duration) -> Result<(), String> {
         eprintln!("Waiting for ArtInChip device to reconnect...");
+        let old_bus = self.bus_number;
+        let old_address = self.address;
         let deadline = Instant::now() + timeout;
         let mut last_err = String::new();
+        let mut old_device_gone = false;
         while Instant::now() < deadline {
-            match self.reopen() {
-                Ok(()) => {
-                    eprintln!("Device reconnected.");
-                    return Ok(());
+            if !old_device_gone {
+                match Self::has_device_at(old_bus, old_address) {
+                    Ok(false) => {
+                        old_device_gone = true;
+                        eprintln!("  Previous device {}:{} disappeared", old_bus, old_address);
+                    }
+                    Ok(true) => {
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(e) => last_err = e,
                 }
-                Err(e) => last_err = e,
             }
-            thread::sleep(Duration::from_millis(500));
+
+            if old_device_gone {
+                match self.reopen() {
+                    Ok(()) => {
+                        eprintln!(
+                            "Device reconnected at {}:{}.",
+                            self.bus_number, self.address
+                        );
+                        thread::sleep(RECONNECT_SETTLE_DELAY);
+                        return Ok(());
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
         }
         Err(format!(
             "Timed out waiting for device reconnect: {}",
@@ -177,7 +352,7 @@ impl AicDevice {
         self.write_bulk(cbw_bytes)?;
         if !payload.is_empty() {
             eprintln!("  >> DATA len={}", payload.len());
-            self.write_bulk(payload)?;
+            self.write_bulk_data_phase(payload)?;
         }
         let csw = self.read_csw(tag, policy)?;
         if let Some(csw) = &csw {
@@ -193,8 +368,20 @@ impl AicDevice {
         Ok(csw)
     }
 
+    fn write_txn_reconnect_once(&mut self, payload: &[u8]) -> Result<AicCsw, String> {
+        match self.write_txn(payload) {
+            Ok(csw) => Ok(csw),
+            Err(e) if e.contains("Bulk write failed at 0/31") || e.contains("Pipe") => {
+                eprintln!("  >> WRITE retry after reconnect: {}", e);
+                self.wait_reconnect(Duration::from_secs(10))?;
+                self.write_txn(payload)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Full read transaction: CBW → data → CSW
-    fn read_txn(&mut self, read_len: u32) -> Result<Vec<u8>, String> {
+    fn read_txn_policy(&mut self, read_len: u32, policy: CswPolicy) -> Result<Vec<u8>, String> {
         let tag = self.next_tag();
 
         let cbw = AicCbw::new_read(tag, read_len);
@@ -209,17 +396,19 @@ impl AicDevice {
         let data = self.read_exact_from_in(read_len as usize, TIMEOUT_MS)?;
         eprintln!("  << DATA {} bytes", data.len());
 
-        let csw = self
-            .read_csw(tag, CswPolicy::Required)?
-            .ok_or_else(|| "CSW unexpectedly missing".to_string())?;
-        eprintln!(
-            "  << CSW tag={} status={} residue={} sig=0x{:08x}",
-            csw.tag_val(),
-            csw.status_val(),
-            csw.data_residue_val(),
-            csw.signature()
-        );
-        self.check_csw(&csw, tag)?;
+        let csw = self.read_csw(tag, policy)?;
+        if let Some(csw) = &csw {
+            eprintln!(
+                "  << CSW tag={} status={} residue={} sig=0x{:08x}",
+                csw.tag_val(),
+                csw.status_val(),
+                csw.data_residue_val(),
+                csw.signature()
+            );
+            self.check_csw(csw, tag)?;
+        } else if policy == CswPolicy::Required {
+            return Err("CSW unexpectedly missing".to_string());
+        }
         Ok(data)
     }
 
@@ -230,12 +419,16 @@ impl AicDevice {
     }
 
     fn write_bulk(&self, data: &[u8]) -> Result<(), String> {
+        self.write_bulk_with_timeout(data, TIMEOUT_MS)
+    }
+
+    fn write_bulk_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<(), String> {
         let mut written = 0usize;
         while written < data.len() {
             let end = (written + BULK_WRITE_CHUNK).min(data.len());
             let n = self
                 .handle
-                .write_bulk(BULK_OUT_EP, &data[written..end], TIMEOUT_MS)
+                .write_bulk(BULK_OUT_EP, &data[written..end], timeout)
                 .map_err(|e| format!("Bulk write failed at {}/{}: {}", written, data.len(), e))?;
             if n == 0 {
                 return Err("Bulk write made no progress".to_string());
@@ -243,6 +436,28 @@ impl AicDevice {
             written += n;
         }
         Ok(())
+    }
+
+    fn write_bulk_data_phase(&self, payload: &[u8]) -> Result<(), String> {
+        let deadline = Instant::now() + START_WRITE_RETRY_TIMEOUT;
+        let mut attempts = 0usize;
+        loop {
+            match self.write_bulk_with_timeout(payload, Duration::from_secs(1)) {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if is_bulk_write_start_timeout(&e, payload.len())
+                        && Instant::now() < deadline =>
+                {
+                    attempts += 1;
+                    eprintln!(
+                        "  >> DATA start retry #{} after endpoint settle: {}",
+                        attempts, e
+                    );
+                    thread::sleep(START_WRITE_RETRY_DELAY);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn read_bulk_to_buffer(&mut self, timeout: Duration) -> Result<usize, rusb::Error> {
@@ -260,6 +475,9 @@ impl AicDevice {
         while self.in_buf.len() < len {
             let now = Instant::now();
             if now >= deadline {
+                if let Some(err) = self.unexpected_csw_error("Bulk read timed out") {
+                    return Err(err);
+                }
                 return Err(format!(
                     "Bulk read timed out with {}/{} bytes buffered",
                     self.in_buf.len(),
@@ -276,6 +494,9 @@ impl AicDevice {
                     len
                 ),
                 Err(rusb::Error::Timeout) => {
+                    if let Some(err) = self.unexpected_csw_error("Bulk read timed out") {
+                        return Err(err);
+                    }
                     return Err(format!(
                         "Bulk read timed out with {}/{} bytes buffered",
                         self.in_buf.len(),
@@ -288,13 +509,33 @@ impl AicDevice {
         Ok(self.in_buf.drain(..len).collect())
     }
 
+    fn unexpected_csw_error(&self, context: &str) -> Option<String> {
+        if self.in_buf.len() < 13 || self.find_csw_signature() != Some(0) {
+            return None;
+        }
+        let csw = AicCsw::from_bytes(&self.in_buf[..13])?;
+        Some(format!(
+            "{}: device returned CSW instead of DATA (tag={}, status={}, residue={}, buffered={})",
+            context,
+            csw.tag_val(),
+            csw.status_val(),
+            csw.data_residue_val(),
+            self.in_buf.len()
+        ))
+    }
+
     fn find_csw_signature(&self) -> Option<usize> {
         let sig = AIC_USB_SIGN_USBS.to_le_bytes();
         self.in_buf.windows(4).position(|w| w == sig)
     }
 
     fn read_csw(&mut self, expected_tag: u32, policy: CswPolicy) -> Result<Option<AicCsw>, String> {
-        let deadline = Instant::now() + TIMEOUT_MS;
+        let deadline = Instant::now()
+            + if policy == CswPolicy::AllowMissing {
+                SHORT_TIMEOUT
+            } else {
+                TIMEOUT_MS
+            };
         loop {
             if let Some(pos) = self.find_csw_signature() {
                 if pos > 0 {
@@ -302,7 +543,14 @@ impl AicDevice {
                     self.in_buf.drain(..pos);
                 }
                 if self.in_buf.len() < 13 {
-                    self.fill_until(deadline, 13)?;
+                    if let Err(e) = self.fill_until(deadline, 13) {
+                        if policy == CswPolicy::AllowMissing {
+                            eprintln!("  << Incomplete CSW accepted by transaction policy: {}", e);
+                            self.in_buf.clear();
+                            return Ok(None);
+                        }
+                        return Err(e);
+                    }
                     continue;
                 }
                 let csw = AicCsw::from_bytes(&self.in_buf[..13])
@@ -348,6 +596,14 @@ impl AicDevice {
                 Ok(_) => {}
                 Err(rusb::Error::Timeout) if policy == CswPolicy::AllowMissing => {
                     eprintln!("  << No CSW after short timeout; accepted by transaction policy");
+                    return Ok(None);
+                }
+                Err(rusb::Error::Pipe | rusb::Error::NoDevice)
+                    if policy == CswPolicy::AllowMissing =>
+                {
+                    eprintln!(
+                        "  << Device disconnected before CSW; accepted by transaction policy"
+                    );
                     return Ok(None);
                 }
                 Err(rusb::Error::Timeout) => {}
@@ -405,7 +661,7 @@ impl AicDevice {
     /// Send only a command header (no payload, no response read).
     /// Used as first step in multi-transaction commands.
     fn send_hdr(&mut self, cmd: u8, data_len: u32) -> Result<(), String> {
-        self.write_txn(&self.build_cmd_hdr(cmd, data_len))?;
+        self.write_txn_reconnect_once(&self.build_cmd_hdr(cmd, data_len))?;
         Ok(())
     }
 
@@ -435,6 +691,18 @@ impl AicDevice {
         self.read_upg_response(cmd, resp_extra, policy)
     }
 
+    fn cmd_hdr_len_prefixed_data_resp(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+        resp_extra: usize,
+    ) -> Result<UpgResponse, String> {
+        self.send_hdr(cmd, (payload.len() + 4) as u32)?;
+        self.write_txn(&(payload.len() as u32).to_le_bytes())?;
+        self.write_txn(payload)?;
+        self.read_upg_response(cmd, resp_extra, CswPolicy::Required)
+    }
+
     fn cmd_hdr_resp(&mut self, cmd: u8, resp_extra: usize) -> Result<UpgResponse, String> {
         self.send_hdr(cmd, 0)?;
         self.read_upg_response(cmd, resp_extra, CswPolicy::Required)
@@ -449,7 +717,7 @@ impl AicDevice {
         // Official AiBurn reads the 16-byte RESP packet first, then reads the
         // optional data packet separately. Reading header+payload in one CBW
         // makes some bootloaders answer the READ CBW with a failed CSW only.
-        let header_data = match self.read_txn(RESP_MIN_HDR_LEN as u32) {
+        let header_data = match self.read_txn_policy(RESP_MIN_HDR_LEN as u32, policy) {
             Ok(data) => data,
             Err(e) if policy == CswPolicy::AllowMissing => {
                 eprintln!("  << No UPG response accepted by transaction policy: {}", e);
@@ -467,7 +735,7 @@ impl AicDevice {
             expected_payload_len
         };
         let payload = if payload_len > 0 {
-            match self.read_txn(payload_len as u32) {
+            match self.read_txn_policy(payload_len as u32, policy) {
                 Ok(data) => data,
                 Err(e) if policy == CswPolicy::AllowMissing => {
                     eprintln!("  << No UPG payload accepted by transaction policy: {}", e);
@@ -518,15 +786,29 @@ impl AicDevice {
         })
     }
 
+    pub fn device_info_text(&mut self) -> Result<String, String> {
+        let hwinfo = self.get_hwinfo()?;
+        let chipid = hwinfo.chipid_val();
+        let mut lines = Vec::new();
+        lines.push(format!("Magic:        {}", hwinfo.magic_str()));
+        lines.push(format!("Init mode:    {:#x}", hwinfo.init_mode()));
+        lines.push(format!("Current mode: {:#x}", hwinfo.curr_mode()));
+        lines.push(format!("Boot stage:   {}", hwinfo.boot_stage()));
+        lines.push(format!(
+            "Chip ID:      {:08x} {:08x} {:08x} {:08x}",
+            chipid[0], chipid[1], chipid[2], chipid[3]
+        ));
+        if let Ok(media) = self.get_storage_media() {
+            lines.push(format!("Storage media: {}", media));
+        }
+        Ok(lines.join("\n"))
+    }
+
     pub fn set_upg_cfg(&mut self, mode: u8) -> Result<(), String> {
-        let cfg = [
-            mode, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
-            0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
-        ];
-        let mut payload = [0u8; 36];
-        payload[0..4].copy_from_slice(&32u32.to_le_bytes()); // cfglen = 32
-        payload[4..].copy_from_slice(&cfg);
-        let _resp = self.cmd_hdr_data_resp(CMD_SET_UPG_CFG, &payload, 0)?;
+        let mut cfg = [0u8; 32];
+        cfg[0] = mode;
+        cfg[1..].copy_from_slice(&OFFICIAL_UPG_CFG_RESERVED);
+        let _resp = self.cmd_hdr_len_prefixed_data_resp(CMD_SET_UPG_CFG, &cfg, 0)?;
         Ok(())
     }
 
@@ -547,8 +829,20 @@ impl AicDevice {
         Ok(block_size)
     }
 
-    fn send_fwc_data_policy(&mut self, chunk: &[u8], policy: CswPolicy) -> Result<(), String> {
-        let _resp = self.cmd_hdr_data_resp_policy(CMD_SEND_FWC_DATA, chunk, 0, policy)?;
+    fn start_fwc_data(&mut self, total_len: usize) -> Result<(), String> {
+        self.send_hdr(CMD_SEND_FWC_DATA, total_len as u32)
+    }
+
+    fn write_fwc_data_chunk(&mut self, chunk: &[u8], policy: CswPolicy) -> Result<(), String> {
+        let csw = self.write_txn_policy(chunk, policy)?;
+        if policy == CswPolicy::AllowMissing && csw.is_none() {
+            let _ = self.drain_in_endpoint(Duration::from_millis(50), 64 * 1024);
+        }
+        Ok(())
+    }
+
+    fn finish_fwc_data(&mut self, policy: CswPolicy) -> Result<(), String> {
+        let _resp = self.read_upg_response(CMD_SEND_FWC_DATA, 0, policy)?;
         Ok(())
     }
 
@@ -581,6 +875,22 @@ impl AicDevice {
         Ok(media)
     }
 
+    pub fn get_device_log(&mut self) -> Result<String, String> {
+        let size_resp = self.cmd_hdr_resp(CMD_GET_LOG_SIZE, 4)?;
+        if size_resp.payload.len() < 4 {
+            return Err(format!(
+                "Log size response too short: {} bytes",
+                size_resp.payload.len()
+            ));
+        }
+        let size = u32::from_le_bytes(size_resp.payload[0..4].try_into().unwrap()) as usize;
+        if size == 0 {
+            return Ok(String::new());
+        }
+        let data_resp = self.cmd_hdr_resp(CMD_GET_LOG_DATA, size)?;
+        Ok(String::from_utf8_lossy(&data_resp.payload).to_string())
+    }
+
     pub fn show_info(&mut self) -> Result<(), String> {
         let hwinfo = self.get_hwinfo()?;
         let chipid = hwinfo.chipid_val();
@@ -601,8 +911,30 @@ impl AicDevice {
         metas: &[FwcMeta],
         _header: &crate::image::parser::FwHeader,
     ) -> Result<(), String> {
-        let classified = classify_components(metas);
+        let options = BurnOptions::default();
+        self.burn_image_with_options(img_data, metas, &options, None)
+    }
+
+    pub fn burn_image_with_options(
+        &mut self,
+        img_data: &[u8],
+        metas: &[FwcMeta],
+        options: &BurnOptions,
+        mut callback: Option<&mut BurnCallback<'_>>,
+    ) -> Result<(), String> {
+        let classified = classify_components(metas, &options.selected_parts);
         print_burn_plan(&classified);
+        emit(
+            &mut callback,
+            BurnEvent::Stage("Build component plan".to_string()),
+        );
+
+        let total_bytes = classified
+            .iter()
+            .filter(|c| c.kind == ComponentKind::ImageInfo || c.selected)
+            .map(|c| c.meta.size_val() as usize)
+            .sum::<usize>();
+        let mut overall_sent = 0usize;
 
         let updater_count = classified
             .iter()
@@ -610,15 +942,62 @@ impl AicDevice {
             .count();
         if updater_count > 0 {
             eprintln!("Start burn online: sending updater components...");
-            for component in classified
+            emit(
+                &mut callback,
+                BurnEvent::Stage("Send updater components".to_string()),
+            );
+            let updater_components: Vec<_> = classified
                 .iter()
                 .filter(|c| c.kind == ComponentKind::Updater)
-            {
-                self.send_component(img_data, component, true)?;
+                .collect();
+            let updater_last_index = updater_components.len().saturating_sub(1);
+            for (index, component) in updater_components.iter().enumerate() {
+                let allow_final_response_no_csw = index == updater_last_index;
+                self.send_component(
+                    img_data,
+                    component,
+                    allow_final_response_no_csw,
+                    &mut overall_sent,
+                    total_bytes,
+                    &mut callback,
+                )?;
+                if index < updater_last_index {
+                    thread::sleep(UPDATER_PROBE_DELAY);
+                    eprintln!("Probing bootloader between updater components...");
+                    emit(
+                        &mut callback,
+                        BurnEvent::Stage("Probe bootloader between updater components".to_string()),
+                    );
+                    if let Err(e) = self.get_hwinfo() {
+                        return Err(format!(
+                            "Bootloader probe between updater components failed: {}",
+                            e
+                        ));
+                    }
+                }
             }
             eprintln!("Updater stage complete; waiting for bootloader upgrade reconnect...");
-            if let Err(e) = self.wait_reconnect(DEFAULT_BURN_TIMEOUT) {
+            emit(
+                &mut callback,
+                BurnEvent::Stage("Wait for bootloader reconnect".to_string()),
+            );
+            if let Err(e) = self.wait_reconnect(options.burn_timeout) {
                 eprintln!("Warning: updater reconnect was not observed: {}", e);
+                emit(
+                    &mut callback,
+                    BurnEvent::Log(format!(
+                        "Warning: updater reconnect was not observed: {}",
+                        e
+                    )),
+                );
+            }
+            eprintln!("Probing bootloader after reconnect...");
+            emit(
+                &mut callback,
+                BurnEvent::Stage("Probe bootloader after reconnect".to_string()),
+            );
+            if let Err(e) = self.get_hwinfo() {
+                return Err(format!("Bootloader probe after reconnect failed: {}", e));
             }
         } else {
             eprintln!(
@@ -627,15 +1006,30 @@ impl AicDevice {
         }
 
         eprintln!("Setting upgrade mode to FULL_DISK_UPGRADE...");
+        emit(
+            &mut callback,
+            BurnEvent::Stage("Set full-disk upgrade mode".to_string()),
+        );
         self.set_upg_cfg(UPG_MODE_FULL_DISK_UPGRADE)?;
 
         if let Some(info) = classified
             .iter()
             .find(|c| c.kind == ComponentKind::ImageInfo)
         {
-            self.send_component(img_data, info, false)?;
+            self.send_component(
+                img_data,
+                info,
+                false,
+                &mut overall_sent,
+                total_bytes,
+                &mut callback,
+            )?;
         } else {
             eprintln!("Warning: no image.info component found");
+            emit(
+                &mut callback,
+                BurnEvent::Log("Warning: no image.info component found".to_string()),
+            );
         }
 
         let selected: Vec<_> = classified
@@ -646,11 +1040,29 @@ impl AicDevice {
             return Err("No selected target components to burn".to_string());
         }
         for component in selected {
-            self.send_component(img_data, component, false)?;
+            self.send_component(
+                img_data,
+                component,
+                false,
+                &mut overall_sent,
+                total_bytes,
+                &mut callback,
+            )?;
         }
 
         eprintln!("Ending upgrade...");
+        emit(&mut callback, BurnEvent::Stage("End upgrade".to_string()));
         self.set_upg_end()?;
+        if options.reset_after_burn {
+            emit(&mut callback, BurnEvent::Stage("Reset device".to_string()));
+            if let Err(e) = self.reset() {
+                emit(
+                    &mut callback,
+                    BurnEvent::Log(format!("Warning: reset failed: {}", e)),
+                );
+            }
+        }
+        emit(&mut callback, BurnEvent::Finished);
 
         Ok(())
     }
@@ -660,6 +1072,9 @@ impl AicDevice {
         img_data: &[u8],
         component: &FirmwareComponent<'_>,
         allow_final_no_csw: bool,
+        overall_sent: &mut usize,
+        overall_total: usize,
+        callback: &mut Option<&mut BurnCallback<'_>>,
     ) -> Result<(), String> {
         let meta = component.meta;
         let name = meta.name_str();
@@ -687,31 +1102,62 @@ impl AicDevice {
             size,
             crc_expected
         );
+        emit(
+            callback,
+            BurnEvent::ComponentStarted {
+                name: name.to_string(),
+                partition: meta.partition_str().to_string(),
+                size,
+            },
+        );
 
         self.set_fwc_meta(meta)?;
 
         let block_size = self.get_block_size().unwrap_or(2048);
         eprintln!("    Block size: {}", block_size);
 
+        self.start_fwc_data(size)?;
+
         let mut data_sent = 0usize;
-        let chunk_max = CHUNK_SIZE as usize;
+        let chunk_max = if component.kind == ComponentKind::Updater {
+            (block_size as usize).saturating_mul(512).max(512)
+        } else {
+            CHUNK_SIZE as usize
+        };
         while data_sent < size {
             let chunk_end = (data_sent + chunk_max).min(size);
             let chunk_offset = offset + data_sent;
             let chunk_size = chunk_end - data_sent;
             let chunk_data = &img_data[chunk_offset..chunk_offset + chunk_size];
-            let final_chunk = chunk_end == size;
-            let policy = if allow_final_no_csw && final_chunk {
-                CswPolicy::AllowMissing
-            } else {
-                CswPolicy::Required
-            };
 
-            self.send_fwc_data_policy(chunk_data, policy)?;
+            self.write_fwc_data_chunk(chunk_data, CswPolicy::Required)?;
             data_sent += chunk_size;
+            *overall_sent += chunk_size;
             let pct = (data_sent as f64 / size as f64) * 100.0;
             eprintln!("    {}: {}/{} ({:.1}%)", name, data_sent, size, pct);
+            emit(
+                callback,
+                BurnEvent::ComponentProgress {
+                    name: name.to_string(),
+                    sent: data_sent,
+                    total: size,
+                },
+            );
+            emit(
+                callback,
+                BurnEvent::OverallProgress {
+                    sent: *overall_sent,
+                    total: overall_total,
+                },
+            );
         }
+
+        let finish_policy = if allow_final_no_csw {
+            CswPolicy::AllowMissing
+        } else {
+            CswPolicy::Required
+        };
+        self.finish_fwc_data(finish_policy)?;
 
         let actual_crc = crc32fast::hash(&img_data[offset..end]);
         if actual_crc != crc_expected {
@@ -719,9 +1165,22 @@ impl AicDevice {
                 "    WARNING: CRC mismatch! expected=0x{:08x}, actual=0x{:08x}",
                 crc_expected, actual_crc
             );
+            emit(
+                callback,
+                BurnEvent::Log(format!(
+                    "WARNING: {} CRC mismatch, expected=0x{:08x}, actual=0x{:08x}",
+                    name, crc_expected, actual_crc
+                )),
+            );
         } else {
             eprintln!("    CRC OK (0x{:08x})", actual_crc);
         }
+        emit(
+            callback,
+            BurnEvent::ComponentFinished {
+                name: name.to_string(),
+            },
+        );
         Ok(())
     }
 }
@@ -730,6 +1189,13 @@ impl Drop for AicDevice {
     fn drop(&mut self) {
         let _ = self.handle.release_interface(0);
     }
+}
+
+fn is_bulk_write_start_timeout(err: &str, len: usize) -> bool {
+    err.contains(&format!(
+        "Bulk write failed at 0/{}: Operation timed out",
+        len
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,7 +1212,10 @@ struct FirmwareComponent<'a> {
     selected: bool,
 }
 
-fn classify_components(metas: &[FwcMeta]) -> Vec<FirmwareComponent<'_>> {
+fn classify_components<'a>(
+    metas: &'a [FwcMeta],
+    selected_parts: &[String],
+) -> Vec<FirmwareComponent<'a>> {
     metas
         .iter()
         .map(|meta| {
@@ -760,7 +1229,8 @@ fn classify_components(metas: &[FwcMeta]) -> Vec<FirmwareComponent<'_>> {
             } else {
                 ComponentKind::Other
             };
-            let selected = kind != ComponentKind::Target || target_part_selected(meta);
+            let selected =
+                kind != ComponentKind::Target || target_part_selected(meta, selected_parts);
             FirmwareComponent {
                 meta,
                 kind,
@@ -770,15 +1240,15 @@ fn classify_components(metas: &[FwcMeta]) -> Vec<FirmwareComponent<'_>> {
         .collect()
 }
 
-fn target_part_selected(meta: &FwcMeta) -> bool {
+fn target_part_selected(meta: &FwcMeta, selected_parts: &[String]) -> bool {
     let partition = meta.partition_str();
     let target_name = meta
         .name_str()
         .strip_prefix("image.target.")
         .unwrap_or_else(|| meta.name_str());
-    DEFAULT_SELECTED_PARTS
+    selected_parts
         .iter()
-        .any(|part| partition == *part || target_name == *part)
+        .any(|part| partition == part || target_name == part || meta.name_str() == part)
 }
 
 fn print_burn_plan(components: &[FirmwareComponent<'_>]) {
@@ -791,5 +1261,11 @@ fn print_burn_plan(components: &[FirmwareComponent<'_>]) {
             component.meta.partition_str(),
             component.selected
         );
+    }
+}
+
+fn emit(callback: &mut Option<&mut BurnCallback<'_>>, event: BurnEvent) {
+    if let Some(callback) = callback.as_deref_mut() {
+        callback(event);
     }
 }

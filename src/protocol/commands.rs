@@ -33,6 +33,7 @@ pub const UPG_MODE_BURN_FROZEN: u8 = 0x05;
 pub const FWC_META_SIZE: usize = 512;
 
 /// FWC Meta entry (512 bytes)
+#[derive(Clone, Debug)]
 pub struct FwcMeta {
     pub bytes: Vec<u8>,
 }

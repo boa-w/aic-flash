@@ -1,0 +1,1115 @@
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+
+use aic_flash::app_config::{append_image_history, load_image_history, AppConfig};
+use aic_flash::i18n::{command_label, tr, Language, Msg};
+use aic_flash::image::parser::{self, ImageSummary, MetaSummary};
+use aic_flash::official::{self, OfficialArgs, OfficialCommand};
+use aic_flash::usb::device::{AicDevice, BurnEvent, BurnOptions, DeviceInfo};
+use eframe::egui;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Tab {
+    Burn,
+    Image,
+    Tools,
+    Settings,
+}
+
+enum WorkerEvent {
+    Burn(BurnEvent),
+    ToolOutput(String),
+    Error(String),
+    Done,
+}
+
+struct GuiApp {
+    config: AppConfig,
+    tab: Tab,
+    devices: Vec<DeviceInfo>,
+    selected_device: Option<usize>,
+    image_summary: Option<ImageSummary>,
+    selected_parts: Vec<String>,
+    image_history: Vec<(PathBuf, String)>,
+    log_lines: Vec<String>,
+    burn_progress: f32,
+    component_progress: f32,
+    active_component: String,
+    busy: bool,
+    auto_started_for_device: bool,
+    rx: Option<Receiver<WorkerEvent>>,
+    official_args: OfficialArgs,
+    settings_path: PathBuf,
+}
+
+impl GuiApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_cjk_font(&cc.egui_ctx);
+        let config = AppConfig::load_default();
+        let settings_path = config.aiburn_dir.join("AiBurn.ini");
+        let image_history = load_image_history(&config.aiburn_dir);
+        let mut app = Self {
+            selected_parts: config.selected_parts.clone(),
+            official_args: OfficialArgs {
+                image: config.image_path.clone(),
+                ..Default::default()
+            },
+            config,
+            tab: Tab::Burn,
+            devices: Vec::new(),
+            selected_device: None,
+            image_summary: None,
+            image_history,
+            log_lines: Vec::new(),
+            burn_progress: 0.0,
+            component_progress: 0.0,
+            active_component: String::new(),
+            busy: false,
+            auto_started_for_device: false,
+            rx: None,
+            settings_path,
+        };
+        app.refresh_devices();
+        if let Some(path) = app.config.image_path.clone() {
+            app.load_image(path);
+        }
+        app
+    }
+
+    fn lang(&self) -> Language {
+        Language::from_code(&self.config.language)
+    }
+
+    fn t(&self, msg: Msg) -> &'static str {
+        tr(self.lang(), msg)
+    }
+
+    fn refresh_devices(&mut self) {
+        match AicDevice::scan_devices() {
+            Ok(devices) => {
+                self.devices = devices;
+                if self.devices.is_empty() {
+                    self.selected_device = None;
+                    self.auto_started_for_device = false;
+                    self.log(self.t(Msg::NoDeviceAvailable));
+                } else {
+                    self.selected_device.get_or_insert(0);
+                    self.log(format!(
+                        "{} {}",
+                        self.devices.len(),
+                        self.t(Msg::DevicesAvailable)
+                    ));
+                    if self.config.auto_burn
+                        && !self.auto_started_for_device
+                        && self.image_summary.is_some()
+                    {
+                        self.auto_started_for_device = true;
+                        self.start_burn();
+                    }
+                }
+            }
+            Err(e) => self.log(format!("{}: {}", self.t(Msg::ScanFailed), e)),
+        }
+    }
+
+    fn load_image(&mut self, path: PathBuf) {
+        match parser::read_image(&path) {
+            Ok((_data, _header, _metas, summary)) => {
+                self.config.image_path = Some(path.clone());
+                self.official_args.image = Some(path.clone());
+                self.image_summary = Some(summary);
+                self.sync_selected_parts_from_image();
+                self.log(format!(
+                    "{} {}",
+                    self.t(Msg::ParseImageHeaderFrom),
+                    path.display()
+                ));
+                let _ = append_image_history(&self.config.aiburn_dir, &path);
+                self.image_history = load_image_history(&self.config.aiburn_dir);
+            }
+            Err(e) => self.log(format!("{}: {}", self.t(Msg::ImageParseFailed), e)),
+        }
+    }
+
+    fn sync_selected_parts_from_image(&mut self) {
+        let Some(summary) = &self.image_summary else {
+            return;
+        };
+        if self.selected_parts.is_empty() {
+            self.selected_parts = self.config.selected_parts.clone();
+        }
+        for meta in target_metas(summary) {
+            let key = part_key(meta);
+            if self
+                .config
+                .selected_parts
+                .iter()
+                .any(|p| p == &key || p == &meta.partition)
+            {
+                continue;
+            }
+        }
+        if self.selected_parts.is_empty() {
+            self.selected_parts = target_metas(summary)
+                .map(part_key)
+                .filter(|key| ["spl", "env", "os"].contains(&key.as_str()))
+                .collect();
+        }
+    }
+
+    fn start_burn(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(path) = self.config.image_path.clone() else {
+            self.log(self.t(Msg::SelectImageFirst));
+            return;
+        };
+        let selected_device = self
+            .selected_device
+            .and_then(|idx| self.devices.get(idx).cloned());
+        let selected_parts = self.selected_parts.clone();
+        let reset_after_burn = true;
+        let timeout = Duration::from_secs(self.config.burn_timeout_secs.max(1));
+        let adb_scan = self.config.adb_scan;
+        let aiburn_dir = self.config.aiburn_dir.clone();
+        let lang = self.lang();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.busy = true;
+        self.burn_progress = 0.0;
+        self.component_progress = 0.0;
+        self.active_component.clear();
+        self.log(format!(
+            "{} {} ...",
+            self.t(Msg::BurnImageFile),
+            path.display()
+        ));
+
+        thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                if adb_scan {
+                    let _ = tx.send(WorkerEvent::ToolOutput(
+                        tr(lang, Msg::StartAdbScan).to_string(),
+                    ));
+                    match official::run_adb_enter_upgrade(&aiburn_dir) {
+                        Ok(text) if !text.trim().is_empty() => {
+                            let _ = tx.send(WorkerEvent::ToolOutput(text));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = tx.send(WorkerEvent::ToolOutput(format!(
+                                "{}: {}",
+                                tr(lang, Msg::AdbScanFailed),
+                                e
+                            )));
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(700));
+                }
+                let (data, _header, metas, _summary) = parser::read_image(&path)?;
+                let mut dev = if let Some(device) = selected_device {
+                    AicDevice::open_by_location(device.bus_number, device.address)?
+                } else {
+                    AicDevice::open_first()?
+                };
+                let options = BurnOptions {
+                    selected_parts,
+                    reset_after_burn,
+                    burn_timeout: timeout,
+                };
+                let mut callback = |event| {
+                    let _ = tx.send(WorkerEvent::Burn(event));
+                };
+                dev.burn_image_with_options(&data, &metas, &options, Some(&mut callback))?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = tx.send(WorkerEvent::Error(e));
+            }
+            let _ = tx.send(WorkerEvent::Done);
+        });
+    }
+
+    fn start_read_device_info(&mut self) {
+        if self.busy {
+            return;
+        }
+        let selected_device = self
+            .selected_device
+            .and_then(|idx| self.devices.get(idx).cloned());
+        let read_log = self.config.read_device_log;
+        let lang = self.lang();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.busy = true;
+        thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut dev = if let Some(device) = selected_device {
+                    AicDevice::open_by_location(device.bus_number, device.address)?
+                } else {
+                    AicDevice::open_first()?
+                };
+                let mut text = dev.device_info_text()?;
+                if read_log {
+                    text.push_str("\n\n");
+                    text.push_str(tr(lang, Msg::DeviceLogDivider));
+                    text.push('\n');
+                    text.push_str(&dev.get_device_log()?);
+                }
+                Ok(text)
+            })();
+            match result {
+                Ok(text) => {
+                    let _ = tx.send(WorkerEvent::ToolOutput(text));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::Error(e));
+                }
+            }
+            let _ = tx.send(WorkerEvent::Done);
+        });
+    }
+
+    fn start_official_command(&mut self) {
+        if self.busy {
+            return;
+        }
+        let upgcmd = self.config.upgcmd_path.clone();
+        let args = match official::build_args(&self.official_args) {
+            Ok(args) => args,
+            Err(e) => {
+                self.log(e);
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.busy = true;
+        self.log(format!(
+            "{}: {} {}",
+            self.t(Msg::RunCommand),
+            upgcmd.display(),
+            args.join(" ")
+        ));
+        thread::spawn(move || {
+            match official::run_upgcmd(&upgcmd, &args) {
+                Ok(text) => {
+                    let _ = tx.send(WorkerEvent::ToolOutput(text));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::Error(e));
+                }
+            }
+            let _ = tx.send(WorkerEvent::Done);
+        });
+    }
+
+    fn poll_worker(&mut self, ctx: &egui::Context) {
+        let mut done = false;
+        if let Some(rx) = self.rx.take() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    WorkerEvent::Burn(event) => self.apply_burn_event(event),
+                    WorkerEvent::ToolOutput(text) => {
+                        for line in text.lines() {
+                            self.log(line);
+                        }
+                    }
+                    WorkerEvent::Error(e) => {
+                        self.log(format!("{}: {}", self.t(Msg::ErrorPrefix), e))
+                    }
+                    WorkerEvent::Done => {
+                        self.busy = false;
+                        done = true;
+                    }
+                }
+                ctx.request_repaint();
+            }
+            if !done {
+                self.rx = Some(rx);
+            }
+        }
+    }
+
+    fn apply_burn_event(&mut self, event: BurnEvent) {
+        match event {
+            BurnEvent::Log(line) => self.log(line),
+            BurnEvent::Stage(stage) => self.log(stage),
+            BurnEvent::ComponentStarted {
+                name,
+                partition,
+                size,
+            } => {
+                self.active_component = name.clone();
+                self.component_progress = 0.0;
+                self.log(format!(
+                    "{} {} {}={} {}={} ...",
+                    self.t(Msg::Meta),
+                    name,
+                    self.t(Msg::PartitionField),
+                    partition,
+                    self.t(Msg::SizeField),
+                    size
+                ));
+            }
+            BurnEvent::ComponentProgress { name, sent, total } => {
+                self.active_component = name;
+                self.component_progress = progress(sent, total);
+            }
+            BurnEvent::OverallProgress { sent, total } => {
+                self.burn_progress = progress(sent, total);
+            }
+            BurnEvent::ComponentFinished { name } => {
+                self.log(format!("{}: {}", self.t(Msg::BurnComponentSuccess), name))
+            }
+            BurnEvent::Finished => {
+                self.burn_progress = 1.0;
+                self.log(self.t(Msg::BurnOnlineSuccess));
+            }
+        }
+    }
+
+    fn log(&mut self, line: impl Into<String>) {
+        self.log_lines.push(line.into());
+        if self.log_lines.len() > 1500 {
+            let overflow = self.log_lines.len() - 1500;
+            self.log_lines.drain(0..overflow);
+        }
+    }
+
+    fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
+        let burn = self.t(Msg::TabBurn);
+        let image = self.t(Msg::TabImage);
+        let tools = self.t(Msg::TabTools);
+        let settings = self.t(Msg::TabSettings);
+        let scan = self.t(Msg::Scan);
+        let device_info = self.t(Msg::DeviceInfo);
+        ui.horizontal(|ui| {
+            selectable_tab(ui, &mut self.tab, Tab::Burn, burn);
+            selectable_tab(ui, &mut self.tab, Tab::Image, image);
+            selectable_tab(ui, &mut self.tab, Tab::Tools, tools);
+            selectable_tab(ui, &mut self.tab, Tab::Settings, settings);
+            ui.separator();
+            if ui.button(scan).clicked() {
+                self.refresh_devices();
+            }
+            ui.add_enabled_ui(!self.busy, |ui| {
+                if ui.button(device_info).clicked() {
+                    self.start_read_device_info();
+                }
+            });
+        });
+    }
+
+    fn ui_burn(&mut self, ui: &mut egui::Ui) {
+        ui.heading(self.t(Msg::AppTitle));
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::Device));
+            egui::ComboBox::from_id_salt("device_select")
+                .selected_text(self.selected_device_label())
+                .show_ui(ui, |ui| {
+                    for (idx, device) in self.devices.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.selected_device,
+                            Some(idx),
+                            format!(
+                                "{}:{}  {:04x}:{:04x}  {}",
+                                device.bus_number,
+                                device.port_path_or_address(),
+                                device.vendor_id,
+                                device.product_id,
+                                device.speed
+                            ),
+                        );
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::Image));
+            let mut text = self
+                .config
+                .image_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(self.t(Msg::SelectImageFile)),
+            );
+            if response.lost_focus() && !text.trim().is_empty() {
+                let path = PathBuf::from(text.trim());
+                if Some(&path) != self.config.image_path.as_ref() {
+                    self.load_image(path);
+                }
+            }
+            if ui.button(self.t(Msg::Browse)).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(self.t(Msg::ArtInChipImageFilter), &["img"])
+                    .pick_file()
+                {
+                    self.load_image(path);
+                }
+            }
+        });
+
+        if !self.image_history.is_empty() {
+            egui::ComboBox::from_id_salt("history")
+                .selected_text(self.t(Msg::ImageHistory))
+                .show_ui(ui, |ui| {
+                    let items = self.image_history.clone();
+                    for (path, ts) in items {
+                        if ui.button(format!("{}  {}", ts, path.display())).clicked() {
+                            self.load_image(path);
+                        }
+                    }
+                });
+        }
+
+        ui.separator();
+        if let Some(summary) = &self.image_summary {
+            ui.label(format!(
+                "{} {} v{} | {} | {} bytes",
+                summary.platform,
+                summary.product,
+                summary.version,
+                summary.media_type,
+                summary.total_size
+            ));
+            ui.label(format!("{}: {}", self.t(Msg::StorageId), summary.media_id));
+        }
+        ui.separator();
+        self.ui_partition_selector(ui);
+        ui.separator();
+        ui.add(egui::ProgressBar::new(self.burn_progress).text(self.t(Msg::Overall)));
+        ui.add(egui::ProgressBar::new(self.component_progress).text(self.active_component.clone()));
+        let auto_burn = self.t(Msg::AutoBurn);
+        let adb_scan = self.t(Msg::AdbScan);
+        let read_device_log = self.t(Msg::ReadDeviceLog);
+        let burn = self.t(Msg::TabBurn);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.busy, |ui| {
+                if ui.button(burn).clicked() {
+                    self.start_burn();
+                }
+            });
+            ui.checkbox(&mut self.config.auto_burn, auto_burn);
+            ui.checkbox(&mut self.config.adb_scan, adb_scan);
+            ui.checkbox(&mut self.config.read_device_log, read_device_log);
+        });
+    }
+
+    fn ui_partition_selector(&mut self, ui: &mut egui::Ui) {
+        let Some(summary) = &self.image_summary else {
+            ui.label(self.t(Msg::NoImageLoaded));
+            return;
+        };
+        let summary = summary.clone();
+        let column_burn = self.t(Msg::ColumnBurn);
+        let column_name = self.t(Msg::ColumnName);
+        let column_partition = self.t(Msg::ColumnPartition);
+        let column_size = self.t(Msg::ColumnSize);
+        let column_offset = self.t(Msg::ColumnOffset);
+        let column_crc = self.t(Msg::ColumnCrc);
+        ui.label(self.t(Msg::Partitions));
+        egui::Grid::new("parts_grid")
+            .striped(true)
+            .min_col_width(90.0)
+            .show(ui, |ui| {
+                ui.label(column_burn);
+                ui.label(column_name);
+                ui.label(column_partition);
+                ui.label(column_size);
+                ui.label(column_offset);
+                ui.label(column_crc);
+                ui.end_row();
+                for meta in &summary.metas {
+                    let key = part_key(meta);
+                    let is_target = meta.name.starts_with("image.target.");
+                    let locked = !is_target;
+                    let mut checked = locked
+                        || self.selected_parts.iter().any(|part| {
+                            part == &key || part == &meta.partition || part == &meta.name
+                        });
+                    ui.add_enabled_ui(!locked, |ui| {
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                if !self.selected_parts.contains(&key) {
+                                    self.selected_parts.push(key.clone());
+                                }
+                            } else {
+                                self.selected_parts.retain(|part| {
+                                    part != &key && part != &meta.partition && part != &meta.name
+                                });
+                            }
+                            self.config.selected_parts = self.selected_parts.clone();
+                        }
+                    });
+                    ui.label(&meta.name);
+                    ui.label(&meta.partition);
+                    ui.label(meta.size.to_string());
+                    ui.label(format!("{:#x}", meta.offset));
+                    ui.label(format!("0x{:08x}", meta.crc));
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn ui_image(&mut self, ui: &mut egui::Ui) {
+        ui.heading(self.t(Msg::TabImage));
+        ui.horizontal(|ui| {
+            if ui.button(self.t(Msg::OpenImage)).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(self.t(Msg::ArtInChipImageFilter), &["img"])
+                    .pick_file()
+                {
+                    self.load_image(path);
+                }
+            }
+            if ui.button(self.t(Msg::ExtractComponents)).clicked() {
+                if let Some(image) = self.config.image_path.clone() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        match parser::extract_components(&image, &dir) {
+                            Ok(files) => self.log(format!(
+                                "{}: {} ({})",
+                                self.t(Msg::ExtractedComponentsTo),
+                                dir.display(),
+                                files.len()
+                            )),
+                            Err(e) => self.log(format!("{}: {}", self.t(Msg::ExtractFailed), e)),
+                        }
+                    }
+                }
+            }
+        });
+
+        if let Some(summary) = &self.image_summary {
+            egui::Grid::new("image_header")
+                .striped(true)
+                .show(ui, |ui| {
+                    row(ui, self.t(Msg::Magic), &summary.magic);
+                    row(ui, self.t(Msg::Platform), &summary.platform);
+                    row(ui, self.t(Msg::Product), &summary.product);
+                    row(ui, self.t(Msg::Version), &summary.version);
+                    row(ui, self.t(Msg::MediaType), &summary.media_type);
+                    row(ui, self.t(Msg::MediaId), &summary.media_id);
+                    row(
+                        ui,
+                        self.t(Msg::MediaDev),
+                        &format!("{:#x}", summary.media_dev_id),
+                    );
+                    row(
+                        ui,
+                        self.t(Msg::MetaOffset),
+                        &format!("{:#x}", summary.meta_offset),
+                    );
+                    row(ui, self.t(Msg::MetaSize), &summary.meta_size.to_string());
+                    row(
+                        ui,
+                        self.t(Msg::FileOffset),
+                        &format!("{:#x}", summary.file_offset),
+                    );
+                    row(ui, self.t(Msg::FileSize), &summary.file_size.to_string());
+                });
+            ui.separator();
+            self.ui_partition_selector(ui);
+        }
+    }
+
+    fn ui_tools(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang();
+        ui.heading(self.t(Msg::OfficialTools));
+        ui.horizontal(|ui| {
+            ui.label("upgcmd");
+            let mut path_text = self.config.upgcmd_path.display().to_string();
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut path_text).desired_width(f32::INFINITY));
+            if response.lost_focus() && !path_text.trim().is_empty() {
+                self.config.upgcmd_path = PathBuf::from(path_text.trim());
+            }
+            if ui.button(self.t(Msg::Browse)).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("upgcmd", &["exe"])
+                    .pick_file()
+                {
+                    self.config.upgcmd_path = path;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::Command));
+            egui::ComboBox::from_id_salt("official_command")
+                .selected_text(command_label(lang, self.official_args.command))
+                .show_ui(ui, |ui| {
+                    for command in OfficialCommand::ALL {
+                        ui.selectable_value(
+                            &mut self.official_args.command,
+                            command,
+                            command_label(lang, command),
+                        );
+                    }
+                });
+            let verbose = tr(lang, Msg::Verbose);
+            let device_log = tr(lang, Msg::DeviceLog);
+            let progress = tr(lang, Msg::Progress);
+            ui.checkbox(&mut self.official_args.verbose, verbose);
+            ui.checkbox(&mut self.official_args.device_log, device_log);
+            ui.checkbox(&mut self.official_args.progress, progress);
+        });
+
+        self.ui_official_args(ui);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.busy, |ui| {
+                if ui.button(self.t(Msg::Run)).clicked() {
+                    self.start_official_command();
+                }
+            });
+            if ui.button(self.t(Msg::EnvCheck)).clicked() {
+                match official::run_env_check(&self.config.aiburn_dir) {
+                    Ok(()) => self.log(self.t(Msg::StartedEnvCheck)),
+                    Err(e) => self.log(e),
+                }
+            }
+            if ui.button(self.t(Msg::Driver)).clicked() {
+                match official::run_driver_installer(&self.config.aiburn_dir) {
+                    Ok(()) => self.log(self.t(Msg::StartedDriverInstaller)),
+                    Err(e) => self.log(e),
+                }
+            }
+            if ui.button(self.t(Msg::Manual)).clicked() {
+                match official::open_manual(&self.config.aiburn_dir) {
+                    Ok(()) => self.log(self.t(Msg::OpenedManual)),
+                    Err(e) => self.log(e),
+                }
+            }
+            match official::build_args(&self.official_args) {
+                Ok(args) => {
+                    ui.label(format!("{}: {}", self.t(Msg::ArgsPrefix), args.join(" ")));
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(180, 40, 40), e);
+                }
+            }
+        });
+    }
+
+    fn ui_official_args(&mut self, ui: &mut egui::Ui) {
+        match self.official_args.command {
+            OfficialCommand::ListDevices
+            | OfficialCommand::DeviceLog
+            | OfficialCommand::ContinueBoot
+            | OfficialCommand::GoToBootloader => {}
+            OfficialCommand::ImageInfo
+            | OfficialCommand::ExtractImage
+            | OfficialCommand::UpgradeImage
+            | OfficialCommand::ListMedia
+            | OfficialCommand::FlashErase
+            | OfficialCommand::RamBoot => {
+                let label = self.t(Msg::Image);
+                let browse = self.t(Msg::Browse);
+                path_picker(ui, label, browse, &mut self.official_args.image, false);
+            }
+            _ => {}
+        }
+        match self.official_args.command {
+            OfficialCommand::WriteMemory => {
+                let label = self.t(Msg::Input);
+                let browse = self.t(Msg::Browse);
+                path_picker(ui, label, browse, &mut self.official_args.input, false);
+            }
+            OfficialCommand::DumpPartition
+            | OfficialCommand::ReadMemory
+            | OfficialCommand::JtagUnlockData => {
+                let label = self.t(Msg::Output);
+                let browse = self.t(Msg::Browse);
+                path_picker(ui, label, browse, &mut self.official_args.output, true);
+            }
+            _ => {}
+        }
+        match self.official_args.command {
+            OfficialCommand::DumpPartition
+            | OfficialCommand::ListPartitions
+            | OfficialCommand::FlashErase => {
+                ui.horizontal(|ui| {
+                    ui.label(self.t(Msg::Media));
+                    ui.text_edit_singleline(&mut self.official_args.media);
+                });
+            }
+            _ => {}
+        }
+        if self.official_args.command == OfficialCommand::DumpPartition {
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::ColumnPartition));
+                ui.text_edit_singleline(&mut self.official_args.partition);
+            });
+        }
+        if self.official_args.command == OfficialCommand::ShellCommand {
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::Shell));
+                ui.text_edit_singleline(&mut self.official_args.shell);
+            });
+        }
+        if self.official_args.command == OfficialCommand::UpgradeImage {
+            let hint = self.t(Msg::FwcListHint);
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::FwcList));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.official_args.fwc_list)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        }
+        if matches!(
+            self.official_args.command,
+            OfficialCommand::WriteMemory
+                | OfficialCommand::ReadMemory
+                | OfficialCommand::WriteLong
+                | OfficialCommand::ReadLong
+                | OfficialCommand::MemTest
+                | OfficialCommand::Exec
+                | OfficialCommand::HexDump
+                | OfficialCommand::Fill
+                | OfficialCommand::Clear
+        ) {
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::Address));
+                ui.text_edit_singleline(&mut self.official_args.address);
+                if matches!(
+                    self.official_args.command,
+                    OfficialCommand::ReadMemory
+                        | OfficialCommand::MemTest
+                        | OfficialCommand::HexDump
+                        | OfficialCommand::Fill
+                        | OfficialCommand::Clear
+                        | OfficialCommand::WriteMemory
+                ) {
+                    ui.label(self.t(Msg::Length));
+                    ui.text_edit_singleline(&mut self.official_args.length);
+                }
+                if matches!(
+                    self.official_args.command,
+                    OfficialCommand::WriteLong | OfficialCommand::Fill
+                ) {
+                    ui.label(self.t(Msg::Value));
+                    ui.text_edit_singleline(&mut self.official_args.value);
+                }
+                if self.official_args.command == OfficialCommand::MemTest {
+                    ui.label(self.t(Msg::Round));
+                    ui.text_edit_singleline(&mut self.official_args.round);
+                }
+            });
+        }
+        if self.official_args.command == OfficialCommand::WriteMemory {
+            let optional = self.t(Msg::Optional);
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::Skip));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.official_args.skip)
+                        .hint_text(optional)
+                        .desired_width(120.0),
+                );
+            });
+        }
+        if self.official_args.command == OfficialCommand::RamBoot {
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::Fwc));
+                ui.text_edit_singleline(&mut self.official_args.fwc_name);
+                ui.label(self.t(Msg::Ram));
+                ui.text_edit_singleline(&mut self.official_args.ram_address);
+            });
+        }
+        if matches!(
+            self.official_args.command,
+            OfficialCommand::Raw | OfficialCommand::JtagUnlock
+        ) {
+            ui.horizontal(|ui| {
+                ui.label(self.t(Msg::Args));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.official_args.raw_args)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        }
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading(self.t(Msg::TabSettings));
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::AiBurnDir));
+            let mut text = self.config.aiburn_dir.display().to_string();
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+            if response.lost_focus() && !text.trim().is_empty() {
+                let path = PathBuf::from(text.trim());
+                if path != self.config.aiburn_dir {
+                    self.config.aiburn_dir = path.clone();
+                    self.config.upgcmd_path = path.join("upgcmd.exe");
+                    self.settings_path = path.join("AiBurn.ini");
+                    self.image_history = load_image_history(&self.config.aiburn_dir);
+                }
+            }
+            if ui.button(self.t(Msg::Browse)).clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.config.aiburn_dir = path.clone();
+                    self.config.upgcmd_path = path.join("upgcmd.exe");
+                    self.settings_path = path.join("AiBurn.ini");
+                    self.image_history = load_image_history(&self.config.aiburn_dir);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::Language));
+            let mut lang = self.lang();
+            egui::ComboBox::from_id_salt("language_select")
+                .selected_text(lang.native_name())
+                .show_ui(ui, |ui| {
+                    for candidate in Language::ALL {
+                        ui.selectable_value(&mut lang, candidate, candidate.native_name());
+                    }
+                });
+            self.config.language = lang.code().to_string();
+            ui.label(self.t(Msg::TimeoutSeconds));
+            ui.add(egui::DragValue::new(&mut self.config.burn_timeout_secs).range(1..=3600));
+            ui.label(self.t(Msg::Retry));
+            ui.add(egui::DragValue::new(&mut self.config.retry_count).range(1..=20));
+        });
+        let verbose_log = self.t(Msg::VerboseLog);
+        let block_error_log = self.t(Msg::BlockErrorLog);
+        let auto_burn = self.t(Msg::AutoBurnWhenReady);
+        let adb_scan = self.t(Msg::AdbScan);
+        let read_device_log = self.t(Msg::ReadDeviceLog);
+        ui.checkbox(&mut self.config.verbose, verbose_log);
+        ui.checkbox(&mut self.config.block_error_log, block_error_log);
+        ui.checkbox(&mut self.config.auto_burn, auto_burn);
+        ui.checkbox(&mut self.config.adb_scan, adb_scan);
+        ui.checkbox(&mut self.config.read_device_log, read_device_log);
+        ui.horizontal(|ui| {
+            if ui.button(self.t(Msg::LoadAiBurnIni)).clicked() {
+                match AppConfig::load_from(&self.settings_path) {
+                    Ok(config) => {
+                        self.config = config;
+                        self.selected_parts = self.config.selected_parts.clone();
+                        self.log(self.t(Msg::LoadedAiBurnIni));
+                    }
+                    Err(e) => self.log(e),
+                }
+            }
+            if ui.button(self.t(Msg::SaveAiBurnIni)).clicked() {
+                self.config.selected_parts = self.selected_parts.clone();
+                match self.config.save_to(&self.settings_path) {
+                    Ok(()) => self.log(format!(
+                        "{} {}",
+                        self.t(Msg::Saved),
+                        self.settings_path.display()
+                    )),
+                    Err(e) => self.log(e),
+                }
+            }
+        });
+    }
+
+    fn ui_log(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(self.t(Msg::Log));
+            if ui.button(self.t(Msg::Clear)).clicked() {
+                self.log_lines.clear();
+            }
+        });
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .max_height(220.0)
+            .show(ui, |ui| {
+                for line in &self.log_lines {
+                    ui.monospace(line);
+                }
+            });
+    }
+
+    fn selected_device_label(&self) -> String {
+        self.selected_device
+            .and_then(|idx| self.devices.get(idx))
+            .map(|device| {
+                format!(
+                    "{}:{}  {:04x}:{:04x}",
+                    device.bus_number,
+                    device.port_path_or_address(),
+                    device.vendor_id,
+                    device.product_id
+                )
+            })
+            .unwrap_or_else(|| self.t(Msg::NoDevice).to_string())
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            self.t(Msg::AppTitle).to_string(),
+        ));
+        self.poll_worker(ctx);
+        egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top_bar(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match self.tab {
+                Tab::Burn => self.ui_burn(ui),
+                Tab::Image => self.ui_image(ui),
+                Tab::Tools => self.ui_tools(ui),
+                Tab::Settings => self.ui_settings(ui),
+            }
+            ui.separator();
+            self.ui_log(ui);
+        });
+    }
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(tr(Language::from_code("zh_cn"), Msg::AppTitle))
+            .with_inner_size([1120.0, 760.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        tr(Language::from_code("zh_cn"), Msg::AppTitle),
+        options,
+        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+    )
+}
+
+fn selectable_tab(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
+    if ui.selectable_label(*current == tab, label).clicked() {
+        *current = tab;
+    }
+}
+
+fn row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.label(key);
+    ui.monospace(value);
+    ui.end_row();
+}
+
+fn path_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    browse_label: &str,
+    path: &mut Option<PathBuf>,
+    save: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut text = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+        if ui.button(browse_label).clicked() {
+            let picked = if save {
+                rfd::FileDialog::new().save_file()
+            } else {
+                rfd::FileDialog::new().pick_file()
+            };
+            if let Some(picked) = picked {
+                *path = Some(picked);
+            }
+        }
+    });
+}
+
+fn target_metas(summary: &ImageSummary) -> impl Iterator<Item = &MetaSummary> {
+    summary
+        .metas
+        .iter()
+        .filter(|meta| meta.name.starts_with("image.target."))
+}
+
+fn part_key(meta: &MetaSummary) -> String {
+    meta.name
+        .strip_prefix("image.target.")
+        .unwrap_or(&meta.name)
+        .to_string()
+}
+
+fn progress(sent: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (sent as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+trait DeviceLabel {
+    fn port_path_or_address(&self) -> String;
+}
+
+impl DeviceLabel for DeviceInfo {
+    fn port_path_or_address(&self) -> String {
+        if self.port_path.is_empty() {
+            self.address.to_string()
+        } else {
+            self.port_path.clone()
+        }
+    }
+}
+
+fn install_cjk_font(ctx: &egui::Context) {
+    let Some((font_path, font_data)) = load_cjk_font() else {
+        eprintln!(
+            "Warning: No CJK font found on this system. Chinese characters might not display correctly."
+        );
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk_font".to_owned(),
+        egui::FontData::from_owned(font_data).into(),
+    );
+
+    println!("Loading CJK font from: {}", font_path);
+    fonts
+        .families
+        .get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "cjk_font".to_owned());
+    fonts
+        .families
+        .get_mut(&egui::FontFamily::Monospace)
+        .unwrap()
+        .insert(0, "cjk_font".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_cjk_font() -> Option<(&'static str, Vec<u8>)> {
+    let candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
+        r"C:\Windows\Fonts\Deng.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei.ttc",
+    ];
+
+    candidates.iter().find_map(|path| {
+        if Path::new(path).exists() {
+            std::fs::read(path).ok().map(|data| (*path, data))
+        } else {
+            None
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn _path_exists(path: &Path) -> bool {
+    path.exists()
+}

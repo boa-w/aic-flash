@@ -1,10 +1,8 @@
-mod image;
-mod protocol;
-mod usb;
-
 use std::fs;
 use std::path::PathBuf;
 
+use aic_flash::image;
+use aic_flash::usb;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -145,20 +143,14 @@ fn cmd_burn(image: PathBuf, no_reset: bool) {
     }
 
     // 5. Burn!
-    if let Err(e) = dev.burn_image(&img_data, &metas, &header) {
+    let options = usb::device::BurnOptions {
+        reset_after_burn: !no_reset,
+        ..Default::default()
+    };
+    if let Err(e) = dev.burn_image_with_options(&img_data, &metas, &options, None) {
         eprintln!("Burn failed: {}", e);
         std::process::exit(1);
     }
 
     println!("Burn completed successfully!");
-
-    // 6. Reset if requested
-    if !no_reset {
-        println!("Resetting device...");
-        if let Err(e) = dev.reset() {
-            eprintln!("Warning: reset failed: {}", e);
-        } else {
-            println!("Device reset.");
-        }
-    }
 }

@@ -12,7 +12,15 @@ Prerequisites: [Rust] 1.70+.
 cargo build --release
 ```
 
-The static binary is placed at `target/release/aic-flash`.
+The CLI binary is placed at `target/release/aic-flash`.
+
+To build the GUI:
+
+```sh
+cargo build --release --bin aic-flash-gui
+```
+
+The GUI binary is placed at `target/release/aic-flash-gui`.
 
 [Rust]: https://rustup.rs
 
@@ -25,6 +33,40 @@ aic-flash info <img>    # parse .img file header and META entries
 aic-flash burn <img>    # burn firmware image to device
 aic-flash burn <img> --no-reset  # burn without resetting
 ```
+
+## GUI
+
+The GUI mirrors the official AiBurn workflow and reads the official default
+configuration from `C:\ArtInChip\AiBurn\AiBurn.ini` when present:
+
+```sh
+cargo run --bin aic-flash-gui
+```
+
+Implemented GUI features:
+
+- USB device scan and device info display for VID `0x33C3`, PID `0x6677`.
+- AiBurn-compatible image loading, header display, image history, component
+  table, component extraction, and target partition selection.
+- AiBurn-style online burn flow with updater stage, reconnect wait,
+  `FULL_DISK_UPGRADE`, `image.info`, selected target components, upgrade end,
+  progress events, CRC checks, and optional reset.
+- Settings compatible with the official `AiBurn.ini` fields:
+  `auto_burn`, `is_verbose`, `read_device_log`, `adb_scan`, `retry_cnt`,
+  `block_err_log`, `burn_timeout`, `language`, `image_path`, and
+  `selected_parts`.
+- Real GUI internationalization with Simplified Chinese (`zh_cn`) and English
+  (`en`), controlled by the `language` setting and saved back to `AiBurn.ini`.
+- An official tools page that wraps `upgcmd.exe` for the advanced functions
+  exposed by the ArtInChip package: list devices, parse/extract image, device
+  log, shell command, continue boot, go to bootloader, memory read/write,
+  32-bit register read/write, memory test, execute, hexdump, fill/clear,
+  full image upgrade through the official tool, dump partition, list media,
+  list partition table, flash erase, RAM boot, JTAG unlock data, JTAG unlock,
+  and raw `upgcmd` arguments.
+
+By default the GUI looks for official tools under `C:\ArtInChip\AiBurn`, but
+the path can be changed in Settings.
 
 ### Examples
 

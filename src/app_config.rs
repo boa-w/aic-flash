@@ -1,0 +1,207 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub auto_burn: bool,
+    pub verbose: bool,
+    pub read_device_log: bool,
+    pub adb_scan: bool,
+    pub retry_count: u32,
+    pub block_error_log: bool,
+    pub burn_timeout_secs: u64,
+    pub language: String,
+    pub image_path: Option<PathBuf>,
+    pub selected_parts: Vec<String>,
+    pub aiburn_dir: PathBuf,
+    pub upgcmd_path: PathBuf,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let aiburn_dir = PathBuf::from(r"C:\ArtInChip\AiBurn");
+        Self {
+            auto_burn: false,
+            verbose: false,
+            read_device_log: false,
+            adb_scan: true,
+            retry_count: 1,
+            block_error_log: false,
+            burn_timeout_secs: 60,
+            language: "zh_cn".to_string(),
+            image_path: None,
+            selected_parts: vec!["spl".to_string(), "env".to_string(), "os".to_string()],
+            upgcmd_path: aiburn_dir.join("upgcmd.exe"),
+            aiburn_dir,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load_default() -> Self {
+        let mut cfg = Self::default();
+        let official_ini = cfg.aiburn_dir.join("AiBurn.ini");
+        if official_ini.exists() {
+            if let Ok(loaded) = Self::load_from(&official_ini) {
+                cfg = loaded;
+            }
+        }
+        cfg
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self, String> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+        let mut cfg = Self::default();
+        if let Some(parent) = path.parent() {
+            cfg.aiburn_dir = parent.to_path_buf();
+            cfg.upgcmd_path = parent.join("upgcmd.exe");
+        }
+
+        let mut section = String::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].to_ascii_lowercase();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            cfg.apply_ini_value(&section, key.trim(), unquote(value.trim()));
+        }
+        Ok(cfg)
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        let selected = self.selected_parts.join(",");
+        let image_path = self
+            .image_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let text = format!(
+            "[debug]\n\
+auto_burn={}\n\
+is_verbose={}\n\
+read_device_log={}\n\
+adb_scan={}\n\
+retry_cnt={}\n\
+block_err_log={}\n\
+\n\
+[system]\n\
+burn_timeout={}\n\
+language={}\n\
+\n\
+[common]\n\
+image_path={}\n\
+selected_parts=\"{}\"\n",
+            bool_to_int(self.auto_burn),
+            bool_to_int(self.verbose),
+            bool_to_int(self.read_device_log),
+            bool_to_int(self.adb_scan),
+            self.retry_count.max(1),
+            bool_to_int(self.block_error_log),
+            self.burn_timeout_secs.max(1),
+            self.language,
+            image_path,
+            selected
+        );
+        fs::write(path, text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
+    }
+
+    fn apply_ini_value(&mut self, section: &str, key: &str, value: &str) {
+        let key = key.to_ascii_lowercase();
+        match (section, key.as_str()) {
+            ("debug", "auto_burn") => self.auto_burn = parse_bool(value),
+            ("debug", "is_verbose") => self.verbose = parse_bool(value),
+            ("debug", "read_device_log") => self.read_device_log = parse_bool(value),
+            ("debug", "adb_scan") => self.adb_scan = parse_bool(value),
+            ("debug", "retry_cnt") => {
+                self.retry_count = value.parse::<u32>().unwrap_or(self.retry_count).max(1)
+            }
+            ("debug", "block_err_log") => self.block_error_log = parse_bool(value),
+            ("system", "burn_timeout") => {
+                self.burn_timeout_secs = value
+                    .parse::<u64>()
+                    .unwrap_or(self.burn_timeout_secs)
+                    .max(1)
+            }
+            ("system", "language") => self.language = value.to_string(),
+            ("common", "image_path") => {
+                if !value.is_empty() {
+                    self.image_path = Some(PathBuf::from(value));
+                }
+            }
+            ("common", "selected_parts") => {
+                self.selected_parts = value
+                    .split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn load_image_history(aiburn_dir: &Path) -> Vec<(PathBuf, String)> {
+    let path = aiburn_dir.join("img_history.txt");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (path, timestamp) = line.rsplit_once(',')?;
+            Some((PathBuf::from(path.trim()), timestamp.trim().to_string()))
+        })
+        .collect()
+}
+
+pub fn append_image_history(aiburn_dir: &Path, image: &Path) -> Result<(), String> {
+    let path = aiburn_dir.join("img_history.txt");
+    let timestamp = current_timestamp();
+    let line = format!(
+        "{}, {}\n",
+        image.to_string_lossy().replace('\\', "/"),
+        timestamp
+    );
+    let old = fs::read_to_string(&path).unwrap_or_default();
+    let new_text = format!("{}{}", line, old);
+    fs::write(&path, new_text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn bool_to_int(value: bool) -> u8 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+fn current_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix_{}", secs)
+}

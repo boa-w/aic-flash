@@ -10,6 +10,7 @@ pub const TRANS_LAYER_CMD_READ: u8 = 0x02;
 
 pub const RESP_MIN_HDR_LEN: usize = 16;
 pub const RESP_LEGACY_HDR_LEN: usize = 24;
+pub const CMD_HDR_LEN: usize = 16;
 
 /// CBW - Command Block Wrapper (31 bytes)
 pub struct AicCbw {
@@ -23,7 +24,7 @@ impl AicCbw {
         b[4..8].copy_from_slice(&tag.to_le_bytes());
         b[8..12].copy_from_slice(&data_len.to_le_bytes());
         // flags = 0x00 (host->dev)
-        // cb_length = 0
+        b[14] = 1; // cb_length
         b[15] = TRANS_LAYER_CMD_WRITE;
         Self { bytes: b }
     }
@@ -34,6 +35,7 @@ impl AicCbw {
         b[4..8].copy_from_slice(&tag.to_le_bytes());
         b[8..12].copy_from_slice(&data_len.to_le_bytes());
         b[12] = 0x80; // flags = dev->host
+        b[14] = 1; // cb_length
         b[15] = TRANS_LAYER_CMD_READ;
         Self { bytes: b }
     }
@@ -80,14 +82,14 @@ impl AicCsw {
     }
 }
 
-/// UPG Command Header (24 bytes)
+/// UPG Command Header (16 bytes)
 pub struct CmdHeader {
-    pub bytes: [u8; 24],
+    pub bytes: [u8; CMD_HDR_LEN],
 }
 
 impl CmdHeader {
     pub fn new(command: u8, data_length: u32) -> Self {
-        let mut b = [0u8; 24];
+        let mut b = [0u8; CMD_HDR_LEN];
         b[0..4].copy_from_slice(&AIC_UPG_SIGN_UPGC.to_le_bytes()); // "UPGC"
         b[4] = 0x01; // protocol
         b[5] = 0x01; // version
@@ -237,5 +239,30 @@ mod tests {
         assert!(resp.is_ok());
         assert_eq!(resp.command(), 0x16);
         assert_eq!(resp.data_length_val(), 64);
+    }
+
+    #[test]
+    fn builds_official_compatible_upg_command_header() {
+        let hdr = CmdHeader::new(0x12, 30480);
+        assert_eq!(hdr.to_bytes().len(), 16);
+        assert_eq!(
+            hdr.to_bytes(),
+            [
+                0x55, 0x50, 0x47, 0x43, 0x01, 0x01, 0x12, 0x00, 0x10, 0x77, 0x00, 0x00, 0x66, 0xc8,
+                0x59, 0x43,
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_official_compatible_cbw_command_length() {
+        let write = AicCbw::new_write(0xc8, 16);
+        assert_eq!(write.to_bytes()[14], 1);
+        assert_eq!(write.to_bytes()[15], TRANS_LAYER_CMD_WRITE);
+
+        let read = AicCbw::new_read(0xc9, 16);
+        assert_eq!(read.to_bytes()[12], 0x80);
+        assert_eq!(read.to_bytes()[14], 1);
+        assert_eq!(read.to_bytes()[15], TRANS_LAYER_CMD_READ);
     }
 }
