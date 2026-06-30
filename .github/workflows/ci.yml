@@ -142,14 +142,62 @@ jobs:
             }
 
       - name: Publish nightly release
-        uses: softprops/action-gh-release@v2
+        uses: actions/github-script@v7
+        env:
+          ASSET_DIR: release-assets
         with:
-          tag_name: nightly
-          name: aic-flash nightly
-          body: |
-            Automated nightly build from `${{ github.sha }}`.
+          script: |
+            const fs = require('fs');
+            const path = require('path');
 
-            Assets are named as `aic-flash-<system>` and include both CLI and GUI binaries.
-          prerelease: true
-          make_latest: false
-          files: release-assets/*
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = 'nightly';
+            const body = [
+              `Automated nightly build from \`${context.sha}\`.`,
+              '',
+              'Assets are named as `aic-flash-<system>` and include both CLI and GUI binaries.',
+            ].join('\n');
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              release = await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.data.id,
+                name: 'aic-flash nightly',
+                body,
+                prerelease: true,
+                make_latest: 'false',
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: context.sha,
+                name: 'aic-flash nightly',
+                body,
+                prerelease: true,
+                make_latest: 'false',
+              });
+            }
+
+            const assetDir = process.env.ASSET_DIR;
+            for (const file of fs.readdirSync(assetDir)) {
+              const fullPath = path.join(assetDir, file);
+              if (!fs.statSync(fullPath).isFile()) continue;
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: release.data.id,
+                name: file,
+                data: fs.readFileSync(fullPath),
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': fs.statSync(fullPath).size,
+                },
+              });
+            }
