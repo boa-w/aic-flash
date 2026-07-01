@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::protocol::commands::{FwcMeta, FWC_META_SIZE};
@@ -164,6 +165,18 @@ impl ImageSummary {
 }
 
 pub fn parse_image(data: &[u8]) -> Result<(FwHeader, Vec<FwcMeta>, &[u8]), String> {
+    let (header, metas, payload_offset) = parse_header_and_metas(data)?;
+    if data.len() < payload_offset {
+        return Err(format!(
+            "File too short for image payload: need {} bytes, have {}",
+            payload_offset,
+            data.len()
+        ));
+    }
+    Ok((header, metas, &data[payload_offset..]))
+}
+
+fn parse_header_and_metas(data: &[u8]) -> Result<(FwHeader, Vec<FwcMeta>, usize), String> {
     if data.len() < FW_HEADER_SIZE {
         return Err("File too small to contain image header".to_string());
     }
@@ -209,11 +222,12 @@ pub fn parse_image(data: &[u8]) -> Result<(FwHeader, Vec<FwcMeta>, &[u8]), Strin
         metas.push(meta);
     }
 
-    if file_offset > 0 {
-        Ok((header, metas, &data[file_offset..]))
+    let payload_offset = if file_offset > 0 {
+        file_offset
     } else {
-        Ok((header, metas, &data[meta_end..]))
-    }
+        meta_end
+    };
+    Ok((header, metas, payload_offset))
 }
 
 pub fn read_image(path: &Path) -> Result<(Vec<u8>, FwHeader, Vec<FwcMeta>, ImageSummary), String> {
@@ -221,6 +235,75 @@ pub fn read_image(path: &Path) -> Result<(Vec<u8>, FwHeader, Vec<FwcMeta>, Image
     let (header, metas, _payload) = parse_image(&data)?;
     let summary = ImageSummary::from_parts(Some(path.to_path_buf()), data.len(), &header, &metas);
     Ok((data, header, metas, summary))
+}
+
+pub fn read_image_summary(path: &Path) -> Result<ImageSummary, String> {
+    let mut file =
+        File::open(path).map_err(|e| format!("Error reading '{}': {}", path.display(), e))?;
+    let total_size = file
+        .metadata()
+        .map_err(|e| format!("Error reading metadata for '{}': {}", path.display(), e))?
+        .len() as usize;
+
+    let mut header_bytes = vec![0u8; FW_HEADER_SIZE];
+    file.read_exact(&mut header_bytes).map_err(|e| {
+        format!(
+            "Error reading image header from '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    let header = FwHeader::from_bytes(&header_bytes)
+        .ok_or_else(|| "Failed to parse firmware header".to_string())?;
+    if header.magic_str() != "AIC.FW" {
+        return Err(format!(
+            "Invalid image magic: '{}' (expected 'AIC.FW')",
+            header.magic_str()
+        ));
+    }
+
+    let meta_offset = header.meta_offset_val() as usize;
+    let meta_size = header.meta_size_val() as usize;
+    if meta_offset == 0 || meta_size == 0 {
+        return Err("No META entries in image header".to_string());
+    }
+    let meta_end = meta_offset
+        .checked_add(meta_size)
+        .ok_or_else(|| "META offset/size overflow".to_string())?;
+    if total_size < meta_end {
+        return Err(format!(
+            "File too short for META entries: need {} bytes, have {}",
+            meta_end, total_size
+        ));
+    }
+
+    let mut meta_bytes = vec![0u8; meta_size];
+    file.seek(SeekFrom::Start(meta_offset as u64))
+        .map_err(|e| format!("Error seeking META entries in '{}': {}", path.display(), e))?;
+    file.read_exact(&mut meta_bytes).map_err(|e| {
+        format!(
+            "Error reading META entries from '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    let meta_count = meta_size / FWC_META_SIZE;
+    let mut metas = Vec::with_capacity(meta_count);
+    for i in 0..meta_count {
+        let entry_offset = i * FWC_META_SIZE;
+        let entry_bytes = &meta_bytes[entry_offset..entry_offset + FWC_META_SIZE];
+        let meta = FwcMeta::from_bytes(entry_bytes)
+            .ok_or_else(|| format!("Failed to parse META entry {}", i))?;
+        metas.push(meta);
+    }
+
+    Ok(ImageSummary::from_parts(
+        Some(path.to_path_buf()),
+        total_size,
+        &header,
+        &metas,
+    ))
 }
 
 pub fn summarize_image(data: &[u8]) -> Result<ImageSummary, String> {

@@ -231,6 +231,7 @@ pub fn load_image_history(app_dir: &Path) -> Vec<(PathBuf, String)> {
         return Vec::new();
     };
     text.lines()
+        .take(50)
         .filter_map(|line| {
             let (path, timestamp) = line.rsplit_once(',')?;
             Some((PathBuf::from(path.trim()), timestamp.trim().to_string()))
@@ -248,8 +249,19 @@ pub fn append_image_history(app_dir: &Path, image: &Path) -> Result<(), String> 
         image.to_string_lossy().replace('\\', "/"),
         timestamp
     );
+    let normalized_image = image.to_string_lossy().replace('\\', "/");
     let old = fs::read_to_string(&path).unwrap_or_default();
-    let new_text = format!("{}{}", line, old);
+    let old = old
+        .lines()
+        .filter(|old_line| !old_line.trim_start().starts_with(&normalized_image))
+        .take(49)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_text = if old.is_empty() {
+        line
+    } else {
+        format!("{}{}\n", line, old)
+    };
     fs::write(&path, new_text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
 }
 

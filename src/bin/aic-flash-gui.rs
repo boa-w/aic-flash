@@ -8,6 +8,7 @@ use std::time::Duration;
 use aic_flash::app_config::{
     append_image_history, compat_tool_path, load_image_history, AppConfig,
 };
+use aic_flash::build_info;
 use aic_flash::i18n::{command_label, tr, Language, Msg};
 use aic_flash::image::parser::{self, ImageSummary, MetaSummary};
 use aic_flash::official::{self, OfficialArgs, OfficialCommand};
@@ -30,6 +31,8 @@ enum WorkerEvent {
     Done,
 }
 
+type DeviceScanResult = (Result<Vec<DeviceInfo>, String>, bool);
+
 struct GuiApp {
     config: AppConfig,
     tab: Tab,
@@ -45,6 +48,8 @@ struct GuiApp {
     busy: bool,
     auto_started_for_device: bool,
     rx: Option<Receiver<WorkerEvent>>,
+    scan_rx: Option<Receiver<DeviceScanResult>>,
+    device_scan_in_progress: bool,
     official_args: OfficialArgs,
     settings_path: PathBuf,
 }
@@ -74,12 +79,14 @@ impl GuiApp {
             busy: false,
             auto_started_for_device: false,
             rx: None,
+            scan_rx: None,
+            device_scan_in_progress: false,
             settings_path,
         };
-        app.refresh_devices();
         if let Some(path) = app.config.image_path.clone() {
-            app.load_image(path);
+            app.load_image_summary(path, false);
         }
+        app.start_device_scan(cc.egui_ctx.clone(), false);
         app
     }
 
@@ -91,8 +98,26 @@ impl GuiApp {
         tr(self.lang(), msg)
     }
 
-    fn refresh_devices(&mut self) {
-        match AicDevice::scan_devices() {
+    fn start_device_scan(&mut self, ctx: egui::Context, allow_auto_burn: bool) {
+        if self.device_scan_in_progress {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.scan_rx = Some(rx);
+        self.device_scan_in_progress = true;
+        thread::spawn(move || {
+            let result = AicDevice::scan_devices();
+            let _ = tx.send((result, allow_auto_burn));
+            ctx.request_repaint();
+        });
+    }
+
+    fn apply_device_scan(
+        &mut self,
+        result: Result<Vec<DeviceInfo>, String>,
+        allow_auto_burn: bool,
+    ) {
+        match result {
             Ok(devices) => {
                 self.devices = devices;
                 if self.devices.is_empty() {
@@ -106,7 +131,8 @@ impl GuiApp {
                         self.devices.len(),
                         self.t(Msg::DevicesAvailable)
                     ));
-                    if self.config.auto_burn
+                    if allow_auto_burn
+                        && self.config.auto_burn
                         && !self.auto_started_for_device
                         && self.image_summary.is_some()
                     {
@@ -120,8 +146,12 @@ impl GuiApp {
     }
 
     fn load_image(&mut self, path: PathBuf) {
-        match parser::read_image(&path) {
-            Ok((_data, _header, _metas, summary)) => {
+        self.load_image_summary(path, true);
+    }
+
+    fn load_image_summary(&mut self, path: PathBuf, update_history: bool) {
+        match parser::read_image_summary(&path) {
+            Ok(summary) => {
                 self.config.image_path = Some(path.clone());
                 self.official_args.image = Some(path.clone());
                 self.image_summary = Some(summary);
@@ -131,8 +161,10 @@ impl GuiApp {
                     self.t(Msg::ParseImageHeaderFrom),
                     path.display()
                 ));
-                let _ = append_image_history(&self.config.app_dir, &path);
-                self.image_history = load_image_history(&self.config.app_dir);
+                if update_history {
+                    let _ = append_image_history(&self.config.app_dir, &path);
+                    self.image_history = load_image_history(&self.config.app_dir);
+                }
             }
             Err(e) => self.log(format!("{}: {}", self.t(Msg::ImageParseFailed), e)),
         }
@@ -313,6 +345,8 @@ impl GuiApp {
     }
 
     fn poll_worker(&mut self, ctx: &egui::Context) {
+        self.poll_device_scan(ctx);
+
         let mut done = false;
         if let Some(rx) = self.rx.take() {
             while let Ok(event) = rx.try_recv() {
@@ -335,6 +369,21 @@ impl GuiApp {
             }
             if !done {
                 self.rx = Some(rx);
+            }
+        }
+    }
+
+    fn poll_device_scan(&mut self, ctx: &egui::Context) {
+        let mut done = false;
+        if let Some(rx) = self.scan_rx.take() {
+            while let Ok((result, allow_auto_burn)) = rx.try_recv() {
+                self.apply_device_scan(result, allow_auto_burn);
+                self.device_scan_in_progress = false;
+                done = true;
+                ctx.request_repaint();
+            }
+            if !done {
+                self.scan_rx = Some(rx);
             }
         }
     }
@@ -398,9 +447,11 @@ impl GuiApp {
             selectable_tab(ui, &mut self.tab, Tab::Tools, tools);
             selectable_tab(ui, &mut self.tab, Tab::Settings, settings);
             ui.separator();
-            if ui.button(scan).clicked() {
-                self.refresh_devices();
-            }
+            ui.add_enabled_ui(!self.device_scan_in_progress, |ui| {
+                if ui.button(scan).clicked() {
+                    self.start_device_scan(ui.ctx().clone(), true);
+                }
+            });
             ui.add_enabled_ui(!self.busy, |ui| {
                 if ui.button(device_info).clicked() {
                     self.start_read_device_info();
@@ -410,7 +461,11 @@ impl GuiApp {
     }
 
     fn ui_burn(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.t(Msg::AppTitle));
+        ui.heading(format!(
+            "{} {}",
+            self.t(Msg::AppTitle),
+            build_info::VERSION_WITH_BUILD
+        ));
         ui.horizontal(|ui| {
             ui.label(self.t(Msg::Device));
             egui::ComboBox::from_id_salt("device_select")
@@ -974,9 +1029,7 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-            self.t(Msg::AppTitle).to_string(),
-        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(app_window_title(self.lang())));
         self.poll_worker(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top_bar(ui));
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -995,14 +1048,22 @@ impl eframe::App for GuiApp {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(tr(Language::from_code("zh_cn"), Msg::AppTitle))
+            .with_title(app_window_title(Language::from_code("zh_cn")))
             .with_inner_size([1120.0, 760.0]),
         ..Default::default()
     };
     eframe::run_native(
-        tr(Language::from_code("zh_cn"), Msg::AppTitle),
+        &app_window_title(Language::from_code("zh_cn")),
         options,
         Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+    )
+}
+
+fn app_window_title(lang: Language) -> String {
+    format!(
+        "{} {}",
+        tr(lang, Msg::AppTitle),
+        build_info::VERSION_WITH_BUILD
     )
 }
 

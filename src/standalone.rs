@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::Command;
 
+use crate::build_info;
 use crate::image::parser;
 use crate::usb::device::AicDevice;
 
+#[cfg(windows)]
 const AIC_WINUSB_INF: &str = r#"; aic-flash WinUSB driver binding for ArtInChip upgrade devices
 [Version]
 Signature="$Windows NT$"
@@ -102,6 +105,9 @@ pub fn image_history_path() -> PathBuf {
 pub fn environment_report(image: Option<&Path>) -> String {
     let mut lines = Vec::new();
     lines.push("aic-flash standalone environment check".to_string());
+    lines.push(format!("Version: {}", build_info::VERSION));
+    lines.push(format!("Build: {}", build_info::BUILD));
+    lines.push(format!("Commit: {}", build_info::COMMIT));
     lines.push(format!("Platform: {}", platform_name()));
     lines.push(format!("Config dir: {}", default_app_dir().display()));
 
@@ -307,7 +313,7 @@ fn usb_permission_hint() -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn usb_permission_hint() -> &'static str {
-    "Hint: macOS usually needs no driver. If USB access fails, close other applications that may have claimed the device."
+    "Hint: macOS usually needs no driver. If USB access fails, close other aic-flash/AiBurn instances, unplug and reconnect the board, and avoid USB hubs while testing."
 }
 
 #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]

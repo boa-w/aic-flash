@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use aic_flash::build_info;
 use aic_flash::image;
 use aic_flash::standalone;
 use aic_flash::usb;
@@ -9,7 +10,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "aic-flash",
-    version,
+    version = build_info::VERSION,
+    long_version = build_info::LONG_VERSION,
     about = "Cross-platform flasher for ArtInChip SoCs"
 )]
 struct Cli {
@@ -98,15 +100,27 @@ fn cmd_usb_list() {
 }
 
 fn cmd_scan() {
-    match usb::device::AicDevice::open_first() {
-        Ok(mut dev) => {
-            println!("Found ArtInChip device!");
-            if let Err(e) = dev.show_info() {
-                eprintln!("Error reading device info: {}", e);
+    match usb::device::AicDevice::scan_devices() {
+        Ok(devices) if devices.is_empty() => {
+            eprintln!("No ArtInChip device found (VID=0x33C3, PID=0x6677)");
+            std::process::exit(1);
+        }
+        Ok(devices) => {
+            println!("Detected {} ArtInChip device(s):", devices.len());
+            for device in &devices {
+                println!(
+                    "  bus={} address={} path={} vid=0x{:04x} pid=0x{:04x} speed={}",
+                    device.bus_number,
+                    device.address,
+                    device.port_path,
+                    device.vendor_id,
+                    device.product_id,
+                    device.speed
+                );
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Failed to scan USB devices: {}", e);
             std::process::exit(1);
         }
     }

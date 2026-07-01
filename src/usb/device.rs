@@ -1,6 +1,13 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use rusb::{DeviceHandle, UsbContext};
 
 use crate::protocol::cbw_csw::*;
@@ -107,6 +114,7 @@ struct UpgResponse {
 
 pub struct AicDevice {
     handle: DeviceHandle<rusb::Context>,
+    _access_lock: UsbAccessLock,
     tag: u32,
     in_buf: Vec<u8>,
     bus_number: u8,
@@ -151,39 +159,28 @@ impl AicDevice {
     }
 
     pub fn scan_devices() -> Result<Vec<DeviceInfo>, String> {
-        let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
-        let devices = context
-            .devices()
-            .map_err(|e| format!("Failed to list USB devices: {}", e))?;
-
-        let mut found = Vec::new();
-        for device in devices.iter() {
-            let desc = device
-                .device_descriptor()
-                .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
-            if desc.vendor_id() != AIC_VID || desc.product_id() != AIC_PID {
-                continue;
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(devices) = scan_devices_macos_ioreg() {
+                return Ok(devices);
             }
-            let port_path = device
-                .port_numbers()
-                .map(|ports| {
-                    ports
-                        .iter()
-                        .map(u8::to_string)
-                        .collect::<Vec<_>>()
-                        .join("-")
-                })
-                .unwrap_or_default();
-            found.push(DeviceInfo {
-                bus_number: device.bus_number(),
-                address: device.address(),
-                vendor_id: desc.vendor_id(),
-                product_id: desc.product_id(),
-                port_path,
-                speed: format!("{:?}", device.speed()),
-            });
         }
-        Ok(found)
+        scan_devices_libusb()
+    }
+
+    pub fn scan_devices_libusb() -> Result<Vec<DeviceInfo>, String> {
+        scan_devices_libusb()
+    }
+
+    pub fn scan_devices_fast() -> Result<Vec<DeviceInfo>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            scan_devices_macos_ioreg()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            scan_devices_libusb()
+        }
     }
 
     pub fn open_first() -> Result<Self, String> {
@@ -202,11 +199,23 @@ impl AicDevice {
         location: Option<(u8, u8)>,
         recover_endpoints: bool,
     ) -> Result<Self, String> {
+        let access_lock = UsbAccessLock::try_acquire()?;
+        Self::open_matching_with_lock(location, recover_endpoints, access_lock)
+    }
+
+    fn open_matching_with_lock(
+        location: Option<(u8, u8)>,
+        recover_endpoints: bool,
+        access_lock: UsbAccessLock,
+    ) -> Result<Self, String> {
         let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
 
         let devices = context
             .devices()
             .map_err(|e| format!("Failed to list USB devices: {}", e))?;
+
+        let mut matched_count = 0usize;
+        let mut last_open_error = None;
 
         for device in devices.iter() {
             let desc = device
@@ -218,9 +227,23 @@ impl AicDevice {
                         continue;
                     }
                 }
-                let handle = device
-                    .open()
-                    .map_err(|e| format!("Failed to open device: {}", e))?;
+                matched_count += 1;
+                let handle = match device.open() {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        let err = format!(
+                            "Found ArtInChip device at bus {} address {}, but failed to open it: {}",
+                            device.bus_number(),
+                            device.address(),
+                            format_usb_open_error(e)
+                        );
+                        if location.is_some() {
+                            return Err(err);
+                        }
+                        last_open_error = Some(err);
+                        continue;
+                    }
+                };
                 if let Ok(active) = handle.kernel_driver_active(0) {
                     if active {
                         let _ = handle.detach_kernel_driver(0);
@@ -256,6 +279,7 @@ impl AicDevice {
 
                 let mut dev = Self {
                     handle,
+                    _access_lock: access_lock,
                     tag: 1,
                     in_buf: Vec::new(),
                     bus_number: device.bus_number(),
@@ -273,6 +297,15 @@ impl AicDevice {
                 return Ok(dev);
             }
         }
+        if let Some(err) = last_open_error {
+            if matched_count > 1 {
+                return Err(format!(
+                    "{} ({} matching devices were detected)",
+                    err, matched_count
+                ));
+            }
+            return Err(err);
+        }
         match location {
             Some((bus, address)) => Err(format!(
                 "No ArtInChip device found at bus {} address {} (VID=0x33C3, PID=0x6677)",
@@ -283,7 +316,7 @@ impl AicDevice {
     }
 
     fn reopen(&mut self) -> Result<(), String> {
-        let replacement = Self::open_first()?;
+        let replacement = Self::open_matching_with_lock(None, false, self._access_lock.clone())?;
         *self = replacement;
         Ok(())
     }
@@ -1317,4 +1350,277 @@ fn emit(callback: &mut Option<&mut BurnCallback<'_>>, event: BurnEvent) {
     if let Some(callback) = callback.as_deref_mut() {
         callback(event);
     }
+}
+
+fn scan_devices_libusb() -> Result<Vec<DeviceInfo>, String> {
+    let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
+    let devices = context
+        .devices()
+        .map_err(|e| format!("Failed to list USB devices: {}", e))?;
+
+    let mut found = Vec::new();
+    for device in devices.iter() {
+        let desc = device
+            .device_descriptor()
+            .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
+        if desc.vendor_id() != AIC_VID || desc.product_id() != AIC_PID {
+            continue;
+        }
+        let port_path = device
+            .port_numbers()
+            .map(|ports| {
+                ports
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            })
+            .unwrap_or_default();
+        found.push(DeviceInfo {
+            bus_number: device.bus_number(),
+            address: device.address(),
+            vendor_id: desc.vendor_id(),
+            product_id: desc.product_id(),
+            port_path,
+            speed: format!("{:?}", device.speed()),
+        });
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "macos")]
+fn scan_devices_macos_ioreg() -> Result<Vec<DeviceInfo>, String> {
+    let output = Command::new("ioreg")
+        .args(["-r", "-c", "IOUSBHostDevice", "-l", "-w", "0", "-d", "0"])
+        .output()
+        .map_err(|e| format!("Failed to run ioreg: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("ioreg exited with {}", output.status));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("ioreg output is not UTF-8: {}", e))?;
+
+    let mut found = Vec::new();
+    let mut current: Option<(IoregUsbDevice, String)> = None;
+    for line in text.lines() {
+        if line.contains("<class IOUSBHostDevice") {
+            if let Some((device, _)) = current.take() {
+                push_ioreg_device(&mut found, Some(device));
+            }
+            current = Some((
+                IoregUsbDevice::default(),
+                ioreg_device_property_prefix(line),
+            ));
+            continue;
+        }
+        let Some((device, property_prefix)) = current.as_mut() else {
+            continue;
+        };
+        if line == format!("{} }}", property_prefix) {
+            if let Some((device, _)) = current.take() {
+                push_ioreg_device(&mut found, Some(device));
+            }
+            continue;
+        }
+        if !line.starts_with(property_prefix.as_str()) {
+            continue;
+        }
+
+        if let Some(value) = parse_ioreg_number(line, "idVendor") {
+            device.vendor_id = Some(value as u16);
+        } else if let Some(value) = parse_ioreg_number(line, "idProduct") {
+            device.product_id = Some(value as u16);
+        } else if let Some(value) = parse_ioreg_number(line, "kUSBAddress")
+            .or_else(|| parse_ioreg_number(line, "USB Address"))
+        {
+            device.address = Some(value as u8);
+        } else if let Some(value) = parse_ioreg_number(line, "locationID") {
+            device.location_id = Some(value as u32);
+        } else if let Some(value) = parse_ioreg_number(line, "USBSpeed") {
+            device.usb_speed = Some(value as u8);
+        }
+    }
+    if let Some((device, _)) = current {
+        push_ioreg_device(&mut found, Some(device));
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct IoregUsbDevice {
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
+    address: Option<u8>,
+    location_id: Option<u32>,
+    usb_speed: Option<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn push_ioreg_device(found: &mut Vec<DeviceInfo>, device: Option<IoregUsbDevice>) {
+    let Some(device) = device else {
+        return;
+    };
+    if device.vendor_id != Some(AIC_VID) || device.product_id != Some(AIC_PID) {
+        return;
+    }
+    found.push(DeviceInfo {
+        bus_number: 0,
+        address: device.address.unwrap_or(0),
+        vendor_id: AIC_VID,
+        product_id: AIC_PID,
+        port_path: device
+            .location_id
+            .map(location_id_to_port_path)
+            .unwrap_or_default(),
+        speed: device
+            .usb_speed
+            .map(usb_speed_label)
+            .unwrap_or("Unknown")
+            .to_string(),
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn ioreg_device_property_prefix(device_line: &str) -> String {
+    let indent = device_line.split("+-o ").next().unwrap_or_default();
+    format!("{}  |", indent)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ioreg_number(line: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{}\" = ", key);
+    let value = line.split_once(&pattern)?.1.trim();
+    value
+        .split(|ch: char| !ch.is_ascii_hexdigit() && ch != 'x' && ch != 'X')
+        .next()
+        .and_then(|raw| {
+            if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                raw.parse().ok()
+            }
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn location_id_to_port_path(location_id: u32) -> String {
+    let path = location_id >> 16;
+    let text = format!("{:04x}", path);
+    let ports = text.trim_start_matches('0');
+    if ports.is_empty() {
+        String::new()
+    } else {
+        ports
+            .chars()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn usb_speed_label(speed: u8) -> &'static str {
+    match speed {
+        1 => "Low/Full",
+        2 => "Full",
+        3 => "High",
+        4 => "Super",
+        _ => "Unknown",
+    }
+}
+
+#[derive(Clone)]
+struct UsbAccessLock {
+    _file: Arc<File>,
+}
+
+impl UsbAccessLock {
+    fn try_acquire() -> Result<Self, String> {
+        let path = usb_access_lock_path()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|e| format!("Failed to open USB access lock '{}': {}", path.display(), e))?;
+
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = file.set_len(0);
+                let mut file_for_pid = file
+                    .try_clone()
+                    .map_err(|e| format!("Failed to clone USB access lock: {}", e))?;
+                let _ = writeln!(file_for_pid, "pid={}", std::process::id());
+                Ok(Self {
+                    _file: Arc::new(file),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(format!(
+                "Another aic-flash instance is using the ArtInChip USB device{} Close the other CLI/GUI instance and retry. Lock: {}",
+                lock_owner_hint(&path),
+                path.display()
+            )),
+            Err(e) => Err(format!(
+                "Failed to lock ArtInChip USB access '{}': {}",
+                path.display(),
+                e
+            )),
+        }
+    }
+}
+
+fn lock_owner_hint(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(owner) if !owner.trim().is_empty() => format!(" ({}).", owner.trim()),
+        _ => ".".to_string(),
+    }
+}
+
+fn usb_access_lock_path() -> Result<PathBuf, String> {
+    let dir = platform_config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create '{}': {}", dir.display(), e))?;
+    Ok(dir.join("aic-flash-usb-33c3-6677.lock"))
+}
+
+fn platform_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("aic-flash");
+        }
+        if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(userprofile).join(".aic-flash");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("aic-flash");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg).join("aic-flash");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".config").join("aic-flash");
+        }
+    }
+    std::env::temp_dir().join("aic-flash")
+}
+
+fn format_usb_open_error(err: rusb::Error) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if err == rusb::Error::Other {
+            return "Other error (macOS IOKit refused USBDeviceOpen; close other aic-flash/AiBurn instances that may have the device open, then unplug and reconnect the board)".to_string();
+        }
+    }
+    format!("{}", err)
 }
