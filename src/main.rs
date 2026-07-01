@@ -21,6 +21,8 @@ struct Cli {
 enum Commands {
     /// Scan for connected ArtInChip devices
     Scan,
+    /// List all USB devices visible through libusb
+    UsbList,
     /// Show the currently selected project, output directory, and toolchain
     Info {
         /// Optional .img file to parse instead of querying a device
@@ -51,10 +53,47 @@ fn main() {
 
     match cli.command {
         Commands::Scan => cmd_scan(),
+        Commands::UsbList => cmd_usb_list(),
         Commands::Info { image } => cmd_info(image),
         Commands::Burn { image, no_reset } => cmd_burn(image, no_reset),
         Commands::EnvCheck { image } => cmd_env_check(image),
         Commands::InstallUsbAccess => cmd_install_usb_access(),
+    }
+}
+
+fn cmd_usb_list() {
+    match usb::device::AicDevice::list_usb_devices() {
+        Ok(devices) => {
+            if devices.is_empty() {
+                println!("No USB devices found.");
+                return;
+            }
+            println!("Visible USB devices:");
+            for device in devices {
+                let marker = if device.vendor_id == 0x33c3 && device.product_id == 0x6677 {
+                    "  <-- ArtInChip upgrade"
+                } else {
+                    ""
+                };
+                println!(
+                    "  bus={:<3} address={:<3} {:04x}:{:04x} class={:02x}/{:02x}/{:02x} speed={:<10} path={}{}",
+                    device.bus_number,
+                    device.address,
+                    device.vendor_id,
+                    device.product_id,
+                    device.class_code,
+                    device.subclass_code,
+                    device.protocol_code,
+                    device.speed,
+                    device.port_path,
+                    marker
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     }
 }
 

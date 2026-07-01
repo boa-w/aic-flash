@@ -36,6 +36,19 @@ pub struct DeviceInfo {
 }
 
 #[derive(Clone, Debug)]
+pub struct UsbDeviceInfo {
+    pub bus_number: u8,
+    pub address: u8,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub port_path: String,
+    pub speed: String,
+    pub class_code: u8,
+    pub subclass_code: u8,
+    pub protocol_code: u8,
+}
+
+#[derive(Clone, Debug)]
 pub struct BurnOptions {
     pub selected_parts: Vec<String>,
     pub reset_after_burn: bool,
@@ -101,6 +114,42 @@ pub struct AicDevice {
 }
 
 impl AicDevice {
+    pub fn list_usb_devices() -> Result<Vec<UsbDeviceInfo>, String> {
+        let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
+        let devices = context
+            .devices()
+            .map_err(|e| format!("Failed to list USB devices: {}", e))?;
+
+        let mut found = Vec::new();
+        for device in devices.iter() {
+            let desc = device
+                .device_descriptor()
+                .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
+            let port_path = device
+                .port_numbers()
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
+                .unwrap_or_default();
+            found.push(UsbDeviceInfo {
+                bus_number: device.bus_number(),
+                address: device.address(),
+                vendor_id: desc.vendor_id(),
+                product_id: desc.product_id(),
+                port_path,
+                speed: format!("{:?}", device.speed()),
+                class_code: desc.class_code(),
+                subclass_code: desc.sub_class_code(),
+                protocol_code: desc.protocol_code(),
+            });
+        }
+        Ok(found)
+    }
+
     pub fn scan_devices() -> Result<Vec<DeviceInfo>, String> {
         let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
         let devices = context
