@@ -130,13 +130,27 @@ pub fn environment_report(image: Option<&Path>) -> String {
             lines.push(format!("USB device: {} detected", devices.len()));
             for device in &devices {
                 lines.push(format!(
-                    "  bus={} address={} path={} speed={}",
-                    device.bus_number, device.address, device.port_path, device.speed
+                    "  bus={} address={} path={} speed={} status={}",
+                    device.bus_number,
+                    device.address,
+                    device.port_path,
+                    device.speed,
+                    if device.ready { "ready" } else { "not-ready" }
                 ));
+                if let Some(status) = &device.status {
+                    lines.push(format!("    {}", status));
+                }
             }
-            match AicDevice::open_first() {
-                Ok(_) => lines.push("USB access: OK".to_string()),
-                Err(e) => lines.push(format!("USB access: FAILED ({})", e)),
+            if devices.iter().any(|device| device.ready) {
+                match AicDevice::open_first() {
+                    Ok(_) => lines.push("USB access: OK".to_string()),
+                    Err(e) => lines.push(format!("USB access: FAILED ({})", e)),
+                }
+            } else {
+                lines.push(
+                    "USB access: SKIPPED (device detected but not ready for USB transfers)"
+                        .to_string(),
+                );
             }
         }
         Err(e) => lines.push(format!("USB scan: FAILED ({})", e)),

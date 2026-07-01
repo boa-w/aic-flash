@@ -40,6 +40,8 @@ pub struct DeviceInfo {
     pub product_id: u16,
     pub port_path: String,
     pub speed: String,
+    pub ready: bool,
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +210,11 @@ impl AicDevice {
         recover_endpoints: bool,
         access_lock: UsbAccessLock,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        if let Some(err) = macos_preflight_open_error(location) {
+            return Err(err);
+        }
+
         let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
 
         let devices = context
@@ -228,6 +235,20 @@ impl AicDevice {
                     }
                 }
                 matched_count += 1;
+                #[cfg(target_os = "macos")]
+                if let Err(e) = macos_check_device_ready(device.address()) {
+                    let err = format!(
+                        "Found ArtInChip device at bus {} address {}, but macOS has not configured it for USB transfers: {}",
+                        device.bus_number(),
+                        device.address(),
+                        e
+                    );
+                    if location.is_some() {
+                        return Err(err);
+                    }
+                    last_open_error = Some(err);
+                    continue;
+                }
                 let handle = match device.open() {
                     Ok(handle) => handle,
                     Err(e) => {
@@ -235,7 +256,7 @@ impl AicDevice {
                             "Found ArtInChip device at bus {} address {}, but failed to open it: {}",
                             device.bus_number(),
                             device.address(),
-                            format_usb_open_error(e)
+                            format_usb_open_error(e, device.address())
                         );
                         if location.is_some() {
                             return Err(err);
@@ -1383,6 +1404,8 @@ fn scan_devices_libusb() -> Result<Vec<DeviceInfo>, String> {
             product_id: desc.product_id(),
             port_path,
             speed: format!("{:?}", device.speed()),
+            ready: true,
+            status: None,
         });
     }
     Ok(found)
@@ -1391,7 +1414,7 @@ fn scan_devices_libusb() -> Result<Vec<DeviceInfo>, String> {
 #[cfg(target_os = "macos")]
 fn scan_devices_macos_ioreg() -> Result<Vec<DeviceInfo>, String> {
     let output = Command::new("ioreg")
-        .args(["-r", "-c", "IOUSBHostDevice", "-l", "-w", "0", "-d", "0"])
+        .args(["-r", "-c", "IOUSBHostDevice", "-l", "-w", "0", "-d", "2"])
         .output()
         .map_err(|e| format!("Failed to run ioreg: {}", e))?;
     if !output.status.success() {
@@ -1416,6 +1439,10 @@ fn scan_devices_macos_ioreg() -> Result<Vec<DeviceInfo>, String> {
         let Some((device, property_prefix)) = current.as_mut() else {
             continue;
         };
+        if line.contains("<class IOUSBHostInterface") {
+            device.has_interface = true;
+            continue;
+        }
         if line == format!("{} }}", property_prefix) {
             if let Some((device, _)) = current.take() {
                 push_ioreg_device(&mut found, Some(device));
@@ -1430,6 +1457,8 @@ fn scan_devices_macos_ioreg() -> Result<Vec<DeviceInfo>, String> {
             device.vendor_id = Some(value as u16);
         } else if let Some(value) = parse_ioreg_number(line, "idProduct") {
             device.product_id = Some(value as u16);
+        } else if parse_ioreg_number(line, "kUSBCurrentConfiguration").is_some() {
+            device.configured = true;
         } else if let Some(value) = parse_ioreg_number(line, "kUSBAddress")
             .or_else(|| parse_ioreg_number(line, "USB Address"))
         {
@@ -1454,6 +1483,8 @@ struct IoregUsbDevice {
     address: Option<u8>,
     location_id: Option<u32>,
     usb_speed: Option<u8>,
+    configured: bool,
+    has_interface: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1464,6 +1495,7 @@ fn push_ioreg_device(found: &mut Vec<DeviceInfo>, device: Option<IoregUsbDevice>
     if device.vendor_id != Some(AIC_VID) || device.product_id != Some(AIC_PID) {
         return;
     }
+    let status = macos_not_ready_status(device.configured, device.has_interface);
     found.push(DeviceInfo {
         bus_number: 0,
         address: device.address.unwrap_or(0),
@@ -1478,6 +1510,8 @@ fn push_ioreg_device(found: &mut Vec<DeviceInfo>, device: Option<IoregUsbDevice>
             .map(usb_speed_label)
             .unwrap_or("Unknown")
             .to_string(),
+        ready: status.is_none(),
+        status,
     });
 }
 
@@ -1528,6 +1562,108 @@ fn usb_speed_label(speed: u8) -> &'static str {
         4 => "Super",
         _ => "Unknown",
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_preflight_open_error(location: Option<(u8, u8)>) -> Option<String> {
+    let devices = scan_devices_macos_ioreg().ok()?;
+    let matching = devices
+        .iter()
+        .filter(|device| {
+            location
+                .map(|(bus, address)| device.bus_number == bus && device.address == address)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if matching.is_empty() || matching.iter().any(|device| device.ready) {
+        return None;
+    }
+    matching.first().map(|device| {
+        format!(
+            "Found ArtInChip device at bus {} address {}, but macOS has not configured it for USB transfers: {}",
+            device.bus_number,
+            device.address,
+            device.status.as_deref().unwrap_or("not ready")
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_check_device_ready(address: u8) -> Result<(), String> {
+    let output = Command::new("ioreg")
+        .args(["-r", "-c", "IOUSBHostDevice", "-l", "-w", "0", "-d", "2"])
+        .output()
+        .map_err(|e| format!("failed to inspect IOKit USB state: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("ioreg exited with {}", output.status));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("ioreg output is not UTF-8: {}", e))?;
+
+    let Some(block) = find_macos_aic_device_block(&text, address) else {
+        return Ok(());
+    };
+    if let Some(status) = macos_not_ready_status(
+        block.contains("\"kUSBCurrentConfiguration\" = "),
+        block.contains("<class IOUSBHostInterface"),
+    ) {
+        return Err(status);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_not_ready_status(configured: bool, has_interface: bool) -> Option<String> {
+    if configured && has_interface {
+        return None;
+    }
+
+    let mut reasons = Vec::new();
+    if !configured {
+        reasons.push("missing kUSBCurrentConfiguration");
+    }
+    if !has_interface {
+        reasons.push("no IOUSBHostInterface endpoints");
+    }
+    Some(format!(
+        "{}. Reconnect the board in upgrade mode, preferably directly to the Mac without a hub; if it persists, power-cycle the board or reboot macOS.",
+        reasons.join(", ")
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_not_ready_status(_configured: bool, _has_interface: bool) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_aic_device_block(text: &str, address: u8) -> Option<String> {
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.starts_with("+-o ") && line.contains("<class IOUSBHostDevice") {
+            if macos_block_matches_aic(&current, address) {
+                return Some(current);
+            }
+            current.clear();
+        }
+        if !current.is_empty() || line.starts_with("+-o ") {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if macos_block_matches_aic(&current, address) {
+        Some(current)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_block_matches_aic(block: &str, address: u8) -> bool {
+    block.contains("\"idVendor\" = 13251")
+        && block.contains("\"idProduct\" = 26231")
+        && (block.contains(&format!("\"kUSBAddress\" = {}", address))
+            || block.contains(&format!("\"USB Address\" = {}", address)))
 }
 
 #[derive(Clone)]
@@ -1615,11 +1751,18 @@ fn platform_config_dir() -> PathBuf {
     std::env::temp_dir().join("aic-flash")
 }
 
-fn format_usb_open_error(err: rusb::Error) -> String {
+fn format_usb_open_error(err: rusb::Error, address: u8) -> String {
     #[cfg(target_os = "macos")]
     {
         if err == rusb::Error::Other {
-            return "Other error (macOS IOKit refused USBDeviceOpen; close other aic-flash/AiBurn instances that may have the device open, then unplug and reconnect the board)".to_string();
+            let state = macos_check_device_ready(address)
+                .err()
+                .map(|reason| format!("; IOKit state: {}", reason))
+                .unwrap_or_default();
+            return format!(
+                "Other error (macOS IOKit refused USBDeviceOpen{}; close other aic-flash/AiBurn instances, then unplug and reconnect the board)",
+                state
+            );
         }
     }
     format!("{}", err)

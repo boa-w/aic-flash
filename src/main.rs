@@ -109,14 +109,18 @@ fn cmd_scan() {
             println!("Detected {} ArtInChip device(s):", devices.len());
             for device in &devices {
                 println!(
-                    "  bus={} address={} path={} vid=0x{:04x} pid=0x{:04x} speed={}",
+                    "  bus={} address={} path={} vid=0x{:04x} pid=0x{:04x} speed={} status={}",
                     device.bus_number,
                     device.address,
                     device.port_path,
                     device.vendor_id,
                     device.product_id,
-                    device.speed
+                    device.speed,
+                    if device.ready { "ready" } else { "not-ready" }
                 );
+                if let Some(status) = &device.status {
+                    println!("    {}", status);
+                }
             }
         }
         Err(e) => {

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aic_flash::app_config::{
     append_image_history, compat_tool_path, load_image_history, AppConfig,
@@ -31,6 +31,13 @@ enum WorkerEvent {
     Done,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NotReadyContext {
+    Scan,
+    BurnCancelled,
+    DeviceInfoCancelled,
+}
+
 type DeviceScanResult = (Result<Vec<DeviceInfo>, String>, bool);
 
 struct GuiApp {
@@ -52,6 +59,7 @@ struct GuiApp {
     device_scan_in_progress: bool,
     official_args: OfficialArgs,
     settings_path: PathBuf,
+    log_started_at: Instant,
 }
 
 impl GuiApp {
@@ -82,6 +90,7 @@ impl GuiApp {
             scan_rx: None,
             device_scan_in_progress: false,
             settings_path,
+            log_started_at: Instant::now(),
         };
         if let Some(path) = app.config.image_path.clone() {
             app.load_image_summary(path, false);
@@ -123,21 +132,48 @@ impl GuiApp {
                 if self.devices.is_empty() {
                     self.selected_device = None;
                     self.auto_started_for_device = false;
-                    self.log(self.t(Msg::NoDeviceAvailable));
-                } else {
-                    self.selected_device.get_or_insert(0);
                     self.log(format!(
-                        "{} {}",
-                        self.devices.len(),
-                        self.t(Msg::DevicesAvailable)
+                        "{}: {}",
+                        self.t(Msg::Scan),
+                        self.t(Msg::NoDeviceAvailable)
                     ));
+                } else {
+                    let ready_count = self.devices.iter().filter(|device| device.ready).count();
+                    let not_ready_count = self.devices.len().saturating_sub(ready_count);
+                    self.selected_device = self
+                        .devices
+                        .iter()
+                        .position(|device| device.ready)
+                        .or(Some(0));
+                    self.log(scan_summary(
+                        self.lang(),
+                        self.devices.len(),
+                        ready_count,
+                        not_ready_count,
+                    ));
+                    let not_ready_devices = self
+                        .devices
+                        .iter()
+                        .filter(|device| !device.ready)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for device in &not_ready_devices {
+                        self.log_not_ready_device(device, NotReadyContext::Scan);
+                    }
                     if allow_auto_burn
                         && self.config.auto_burn
                         && !self.auto_started_for_device
                         && self.image_summary.is_some()
+                        && ready_count > 0
                     {
                         self.auto_started_for_device = true;
                         self.start_burn();
+                    } else if allow_auto_burn
+                        && self.config.auto_burn
+                        && self.image_summary.is_some()
+                        && ready_count == 0
+                    {
+                        self.log(auto_burn_skipped(self.lang()));
                     }
                 }
             }
@@ -207,6 +243,15 @@ impl GuiApp {
         let selected_device = self
             .selected_device
             .and_then(|idx| self.devices.get(idx).cloned());
+        if let Some(device) = &selected_device {
+            if !device.ready {
+                self.log_not_ready_device(device, NotReadyContext::BurnCancelled);
+                return;
+            }
+        } else if !self.devices.is_empty() && self.devices.iter().all(|device| !device.ready) {
+            self.log(burn_cancelled_no_ready(self.lang()));
+            return;
+        }
         let selected_parts = self.selected_parts.clone();
         let reset_after_burn = true;
         let timeout = Duration::from_secs(self.config.burn_timeout_secs.max(1));
@@ -277,6 +322,15 @@ impl GuiApp {
         let selected_device = self
             .selected_device
             .and_then(|idx| self.devices.get(idx).cloned());
+        if let Some(device) = &selected_device {
+            if !device.ready {
+                self.log_not_ready_device(device, NotReadyContext::DeviceInfoCancelled);
+                return;
+            }
+        } else if !self.devices.is_empty() && self.devices.iter().all(|device| !device.ready) {
+            self.log(device_info_cancelled_no_ready(self.lang()));
+            return;
+        }
         let read_log = self.config.read_device_log;
         let lang = self.lang();
         let (tx, rx) = mpsc::channel();
@@ -358,7 +412,7 @@ impl GuiApp {
                         }
                     }
                     WorkerEvent::Error(e) => {
-                        self.log(format!("{}: {}", self.t(Msg::ErrorPrefix), e))
+                        self.log_error(e);
                     }
                     WorkerEvent::Done => {
                         self.busy = false;
@@ -427,11 +481,41 @@ impl GuiApp {
     }
 
     fn log(&mut self, line: impl Into<String>) {
-        self.log_lines.push(line.into());
+        let elapsed = self.log_started_at.elapsed();
+        let minutes = elapsed.as_secs() / 60;
+        let seconds = elapsed.as_secs() % 60;
+        self.log_lines
+            .push(format!("[{:02}:{:02}] {}", minutes, seconds, line.into()));
         if self.log_lines.len() > 1500 {
             let overflow = self.log_lines.len() - 1500;
             self.log_lines.drain(0..overflow);
         }
+    }
+
+    fn log_error(&mut self, error: String) {
+        self.log(format!("{}: {}", self.t(Msg::ErrorPrefix), error));
+        if error.contains("macOS has not configured it for USB transfers")
+            || error.contains("kUSBCurrentConfiguration")
+            || error.contains("IOUSBHostInterface")
+        {
+            self.log(macos_recovery_hint(self.lang()));
+        }
+    }
+
+    fn log_not_ready_device(&mut self, device: &DeviceInfo, context: NotReadyContext) {
+        let status = device
+            .status
+            .as_deref()
+            .map(|status| localize_device_status(self.lang(), status))
+            .unwrap_or_else(|| readiness_label(self.lang(), false).to_string());
+        self.log(format!(
+            "{}: {} {} ({})",
+            not_ready_context_label(self.lang(), context),
+            format_device_ref(device),
+            readiness_label(self.lang(), false),
+            status
+        ));
+        self.log(macos_recovery_hint(self.lang()));
     }
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -466,6 +550,7 @@ impl GuiApp {
             self.t(Msg::AppTitle),
             build_info::VERSION_WITH_BUILD
         ));
+        let lang = self.lang();
         ui.horizontal(|ui| {
             ui.label(self.t(Msg::Device));
             egui::ComboBox::from_id_salt("device_select")
@@ -476,12 +561,13 @@ impl GuiApp {
                             &mut self.selected_device,
                             Some(idx),
                             format!(
-                                "{}:{}  {:04x}:{:04x}  {}",
+                                "{}:{}  {:04x}:{:04x}  {}  {}",
                                 device.bus_number,
                                 device.port_path_or_address(),
                                 device.vendor_id,
                                 device.product_id,
-                                device.speed
+                                device.speed,
+                                readiness_label(lang, device.ready)
                             ),
                         );
                     }
@@ -1016,11 +1102,12 @@ impl GuiApp {
             .and_then(|idx| self.devices.get(idx))
             .map(|device| {
                 format!(
-                    "{}:{}  {:04x}:{:04x}",
+                    "{}:{}  {:04x}:{:04x}  {}",
                     device.bus_number,
                     device.port_path_or_address(),
                     device.vendor_id,
-                    device.product_id
+                    device.product_id,
+                    readiness_label(self.lang(), device.ready)
                 )
             })
             .unwrap_or_else(|| self.t(Msg::NoDevice).to_string())
@@ -1138,6 +1225,95 @@ impl DeviceLabel for DeviceInfo {
             self.address.to_string()
         } else {
             self.port_path.clone()
+        }
+    }
+}
+
+fn scan_summary(lang: Language, detected: usize, ready: usize, not_ready: usize) -> String {
+    match lang {
+        Language::ZhCn => format!(
+            "扫描完成：检测到 {} 个 ArtInChip 设备，{} 个就绪，{} 个未就绪",
+            detected, ready, not_ready
+        ),
+        Language::En => format!(
+            "Scan complete: detected {} ArtInChip device(s), {} ready, {} not ready",
+            detected, ready, not_ready
+        ),
+    }
+}
+
+fn readiness_label(lang: Language, ready: bool) -> &'static str {
+    match (lang, ready) {
+        (Language::ZhCn, true) => "就绪",
+        (Language::ZhCn, false) => "未就绪",
+        (Language::En, true) => "ready",
+        (Language::En, false) => "not-ready",
+    }
+}
+
+fn auto_burn_skipped(lang: Language) -> &'static str {
+    match lang {
+        Language::ZhCn => "已跳过自动烧录：当前没有就绪的 ArtInChip 设备",
+        Language::En => "Auto burn skipped: no ready ArtInChip device",
+    }
+}
+
+fn not_ready_context_label(lang: Language, context: NotReadyContext) -> &'static str {
+    match (lang, context) {
+        (Language::ZhCn, NotReadyContext::Scan) => "扫描发现未就绪设备",
+        (Language::ZhCn, NotReadyContext::BurnCancelled) => "烧录已取消",
+        (Language::ZhCn, NotReadyContext::DeviceInfoCancelled) => "读取设备信息已取消",
+        (Language::En, NotReadyContext::Scan) => "Scan found a not-ready device",
+        (Language::En, NotReadyContext::BurnCancelled) => "Burn cancelled",
+        (Language::En, NotReadyContext::DeviceInfoCancelled) => "Device info cancelled",
+    }
+}
+
+fn burn_cancelled_no_ready(lang: Language) -> &'static str {
+    match lang {
+        Language::ZhCn => "烧录已取消：检测到 ArtInChip 设备，但当前没有设备就绪",
+        Language::En => "Burn cancelled: detected ArtInChip devices are not ready",
+    }
+}
+
+fn device_info_cancelled_no_ready(lang: Language) -> &'static str {
+    match lang {
+        Language::ZhCn => "读取设备信息已取消：检测到 ArtInChip 设备，但当前没有设备就绪",
+        Language::En => "Device info cancelled: detected ArtInChip devices are not ready",
+    }
+}
+
+fn format_device_ref(device: &DeviceInfo) -> String {
+    format!(
+        "bus={} path={} address={} vid=0x{:04x} pid=0x{:04x} speed={}",
+        device.bus_number,
+        device.port_path_or_address(),
+        device.address,
+        device.vendor_id,
+        device.product_id,
+        device.speed
+    )
+}
+
+fn localize_device_status(lang: Language, status: &str) -> String {
+    if lang == Language::ZhCn
+        && (status.contains("kUSBCurrentConfiguration") || status.contains("IOUSBHostInterface"))
+    {
+        return format!(
+            "macOS 已枚举 VID/PID，但还没有为设备创建 USB 配置或接口；原始状态：{}",
+            status
+        );
+    }
+    status.to_string()
+}
+
+fn macos_recovery_hint(lang: Language) -> &'static str {
+    match lang {
+        Language::ZhCn => {
+            "处理建议：关闭其它 aic-flash/AiBurn 实例，拔插或断电重启板子，重新进入升级模式；优先直连 Mac，先避开 hub/dock。"
+        }
+        Language::En => {
+            "Recovery hint: close other aic-flash/AiBurn instances, unplug or power-cycle the board, enter upgrade mode again, and test with a direct Mac connection before using hubs/docks."
         }
     }
 }
